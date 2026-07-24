@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily YOLO Experiment Monitor backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=experiment-monitor-backup.service
+
+[Install]
+WantedBy=timers.target

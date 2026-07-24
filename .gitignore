@@ -1,0 +1,47 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime configuration and credentials
+.env
+.env.*
+!*.env.example
+monitor_config.env
+queue_agent_config.json
+experiment-monitor.env
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+*.lock
+logs/
+backups/
+
+# Build and release output
+build/
+dist/
+bin/
+obj/
+*.exe
+*.pdb
+*.zip
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

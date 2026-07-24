@@ -1,0 +1,17 @@
+[Unit]
+Description=YOLO Experiment Queue Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=biiteam
+WorkingDirectory=/opt/yolo-monitor-agent
+ExecStart=/usr/bin/python3 /opt/yolo-monitor-agent/queue_agent.py --config /etc/yolo-monitor-agent.json
+Restart=always
+RestartSec=10
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

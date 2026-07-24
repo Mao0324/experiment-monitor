@@ -1,0 +1,30 @@
+[Unit]
+Description=YOLO Experiment Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=experiment-monitor
+Group=experiment-monitor
+WorkingDirectory=/opt/experiment-monitor/app
+EnvironmentFile=/etc/experiment-monitor.env
+ExecStart=/usr/bin/python3 /opt/experiment-monitor/app/monitor_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# systemd hardening; the application only needs its data directory and network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/experiment-monitor/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+{
+  "server_url": "https://monitor.maocong.me",
+  "api_token": "replace-with-the-same-monitor-api-token",
+  "agent_id": "biiteam-training-01",
+  "worker_slots": 4,
+  "allowed_roots": [
+    "/media/biiteam/新加卷/biiteam/MCONG/Yolov8_TwoStream"
+  ],
+  "allowed_executables": ["python", "python3"],
+  "training_python": "/home/biiteam/anaconda3/envs/spikeyolo/bin/python",
+  "default_batch": 64,
+  "script_scan_seconds": 300,
+  "script_scan_limit": 300,
+  "preflight_import_timeout_seconds": 90,
+  "poll_seconds": 10,
+  "gpu_idle_utilization_percent": 5,
+  "gpu_idle_memory_used_mb": 3000,
+  "idle_reminder_seconds": 2100,
+  "idle_reminder_gpu_count": 2,
+  "min_disk_free_gb": 20,
+  "auto_discover_last_checkpoint": false,
+  "log_directory": "~/.local/state/yolo-monitor-agent",
+  "state_file": "~/.local/state/yolo-monitor-agent/agent-state.json"
+}
