@@ -61,10 +61,11 @@ namespace YoloMonitorPet
         public int Left { get; set; }
         public int Top { get; set; }
         public bool HasPosition { get; set; }
+        public string VisualStyle { get; set; }
 
         public static AppSettings Default()
         {
-            return new AppSettings { ServerUrl = "https://monitor.maocong.me" };
+            return new AppSettings { ServerUrl = "https://monitor.maocong.me", VisualStyle = "material" };
         }
 
         private static string SettingsPath
@@ -86,6 +87,7 @@ namespace YoloMonitorPet
                 settings.Left = Json.Int(root, "left");
                 settings.Top = Json.Int(root, "top");
                 settings.HasPosition = Json.Bool(root, "has_position");
+                settings.VisualStyle = Json.Text(root, "visual_style", settings.VisualStyle);
                 return settings;
             }
             catch { return Default(); }
@@ -100,6 +102,7 @@ namespace YoloMonitorPet
             root["left"] = Left;
             root["top"] = Top;
             root["has_position"] = HasPosition;
+            root["visual_style"] = VisualStyle;
             File.WriteAllText(SettingsPath, Json.Serialize(root), Encoding.UTF8);
         }
     }

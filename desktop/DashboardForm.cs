@@ -14,40 +14,43 @@ namespace YoloMonitorPet
     {
         private readonly MonitorState state;
         private readonly AppSettings settings;
-        private readonly DataGridView grid;
-        private readonly TextBox searchBox;
-        private readonly Button statusFilter;
-        private int statusFilterIndex;
-        private readonly CheckBox favoriteOnly;
-        private readonly Label connectionLabel;
-        private readonly Label runningCard;
-        private readonly Label completedCard;
-        private readonly Label stalledCard;
-        private readonly Label selectedTitle;
-        private readonly Label selectedStatus;
-        private readonly Label epochValue;
-        private readonly Label batchValue;
-        private readonly Label timeValue;
-        private readonly ModernProgress progress;
-        private readonly Label metricsText;
-        private readonly RichTextBox hostText;
-        private readonly RichTextBox logText;
-        private readonly TextBox groupBox;
-        private readonly TextBox tagsBox;
-        private readonly CheckBox favoriteBox;
-        private readonly ComboBox metricSelector;
-        private readonly TrendChart chart;
-        private readonly Label bestText;
-        private readonly Button saveButton;
-        private readonly Button deleteButton;
-        private readonly Button compareButton;
-        private readonly Button updateButton;
-        private readonly Button notesButton;
         private readonly HashSet<string> comparisonIds = new HashSet<string>();
+        private DataGridView grid;
+        private TextBox searchBox;
+        private Button statusFilter;
+        private int statusFilterIndex;
+        private CheckBox favoriteOnly;
+        private Label connectionLabel;
+        private Label runningCard;
+        private Label completedCard;
+        private Label stalledCard;
+        private Label selectedTitle;
+        private Label selectedStatus;
+        private StatusPill selectedStatusPill;
+        private Label epochValue;
+        private Label batchValue;
+        private Label timeValue;
+        private ModernProgress progress;
+        private Label metricsText;
+        private RichTextBox hostText;
+        private RichTextBox logText;
+        private TextBox groupBox;
+        private TextBox tagsBox;
+        private CheckBox favoriteBox;
+        private ComboBox metricSelector;
+        private TrendChart chart;
+        private Label bestText;
+        private Button saveButton;
+        private Button deleteButton;
+        private Button compareButton;
+        private Button updateButton;
+        private Button notesButton;
         private Dictionary<string, object> selectedRun;
         private Dictionary<string, object> selectedDetail;
         private bool loadingDetail;
         private bool populatingGrid;
+
+        public event EventHandler VisualStyleChanged;
 
         [DllImport("user32.dll")]
         private static extern bool ReleaseCapture();
@@ -68,312 +71,38 @@ namespace YoloMonitorPet
         {
             this.state = state;
             this.settings = settings;
-            Text = "YOLO 实验监控 · Epoch 精灵";
+            Text = "Epoch Studio · YOLO 实验监控";
             Icon = Theme.CreateAppIcon();
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None;
-            MinimumSize = new Size(1080, 680);
-            ClientSize = new Size(1280, 780);
+            MinimumSize = new Size(1120, 700);
+            ClientSize = new Size(1380, 840);
             BackColor = Theme.Back;
             ForeColor = Theme.Text;
             Font = Theme.Font(9, FontStyle.Regular);
 
-            Panel header = new Panel { Dock = DockStyle.Fill, Height = 82, Padding = new Padding(26, 14, 20, 10), BackColor = Theme.Panel2, Margin = new Padding(0) };
-            Label title = Theme.Label("YOLO  LAB", 15.5f, FontStyle.Bold, Theme.Text);
-            title.Location = new Point(28, 13);
-            connectionLabel = Theme.Label("● 正在连接", 8.5f, FontStyle.Regular, Theme.Muted);
-            connectionLabel.Location = new Point(30, 47);
-            Button refresh = Theme.Button("立即刷新", false);
-            Button queueCenter = Theme.Button("实验队列", false);
-            updateButton = Theme.Button("检查更新", false);
-            Button server = Theme.Button("服务器设置", false);
-            Button minimize = Theme.Button("—", false);
-            Button maximize = Theme.Button("□", false);
-            Button close = Theme.Button("×", false);
-            refresh.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            queueCenter.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            updateButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            server.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-            refresh.Size = new Size(96, 36); refresh.AutoSize = false;
-            queueCenter.Size = new Size(96, 36); queueCenter.AutoSize = false;
-            updateButton.Size = new Size(96, 36); updateButton.AutoSize = false;
-            server.Size = new Size(106, 36); server.AutoSize = false;
-            foreach (Button windowButton in new Button[] { minimize, maximize, close })
-            {
-                windowButton.Size = new Size(38, 34); windowButton.AutoSize = false; windowButton.Font = Theme.Font(10, FontStyle.Bold); windowButton.BackColor = Theme.Panel2;
-            }
-            close.ForeColor = Theme.Red;
-            header.Resize += delegate
-            {
-                close.Location = new Point(header.ClientSize.Width - 48, 12);
-                maximize.Location = new Point(header.ClientSize.Width - 90, 12);
-                minimize.Location = new Point(header.ClientSize.Width - 132, 12);
-                server.Location = new Point(header.ClientSize.Width - 252, 12);
-                updateButton.Location = new Point(header.ClientSize.Width - 362, 12);
-                refresh.Location = new Point(header.ClientSize.Width - 472, 12);
-                queueCenter.Location = new Point(header.ClientSize.Width - 582, 12);
-            };
-            refresh.Click += async delegate { if (state != null) await state.RefreshAsync(); };
-            queueCenter.Click += delegate { if (state != null) { QueueForm form = new QueueForm(state.Api); form.Show(this); } };
-            updateButton.Click += async delegate
-            {
-                if (state == null) return;
-                updateButton.Enabled = false;
-                await UpdateWorkflow.CheckAndPromptAsync(this, settings.ServerUrl, false, delegate(string text) { updateButton.Text = text; });
-                updateButton.Enabled = true;
-            };
-            server.Click += OnServerSettings;
-            minimize.Click += delegate { WindowState = FormWindowState.Minimized; };
-            maximize.Click += delegate { WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized; };
-            close.Click += delegate { Close(); };
-            header.MouseDown += DragWindow;
-            title.MouseDown += DragWindow;
-            header.DoubleClick += delegate { maximize.PerformClick(); };
-            header.Controls.Add(title);
-            header.Controls.Add(connectionLabel);
-            header.Controls.Add(refresh);
-            header.Controls.Add(queueCenter);
-            header.Controls.Add(updateButton);
-            header.Controls.Add(server);
-            header.Controls.Add(minimize);
-            header.Controls.Add(maximize);
-            header.Controls.Add(close);
-            SplitContainer split = new SplitContainer();
-            split.Dock = DockStyle.Fill;
-            split.BackColor = Theme.Line;
-            split.Panel1.BackColor = Theme.Back;
-            split.Panel2.BackColor = Theme.Back;
-            split.Panel1.Padding = new Padding(18, 8, 8, 18);
-            split.Panel2.Padding = new Padding(8, 8, 18, 18);
-            TableLayoutPanel rootLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = new Padding(0), Padding = new Padding(0), BackColor = Theme.Back };
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 82));
-            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            rootLayout.Controls.Add(header, 0, 0);
-            rootLayout.Controls.Add(split, 0, 1);
-            Controls.Add(rootLayout);
-            Shown += delegate { split.SplitterDistance = Math.Max(330, Math.Min(470, (int)(split.ClientSize.Width * .34))); };
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.RowCount = 2;
+            root.ColumnCount = 1;
+            root.Margin = new Padding(0);
+            root.Padding = new Padding(0);
+            root.BackColor = Theme.Back;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 78));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            root.Controls.Add(BuildHeader(), 0, 0);
+            root.Controls.Add(BuildWorkspace(), 0, 1);
+            Controls.Add(root);
+
             Resize += delegate
             {
                 if (WindowState == FormWindowState.Normal)
-                    using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width, Height), 14)) Region = new Region(path);
+                {
+                    using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width, Height), Theme.Mode == VisualStyleMode.Clay ? 18 : 10))
+                        Region = new Region(path);
+                }
                 else Region = null;
             };
-
-            DarkPanel listPanel = new DarkPanel { Dock = DockStyle.Fill, Padding = new Padding(14), Radius = 16 };
-            Panel filters = new Panel { Dock = DockStyle.Top, Height = 112, BackColor = Theme.Panel };
-            Label libraryTitle = Theme.Label("实验库", 11, FontStyle.Bold, Theme.Text);
-            libraryTitle.Location = new Point(0, 0);
-            Label libraryHint = Theme.Label("RUNS", 7.5f, FontStyle.Bold, Theme.Blue);
-            libraryHint.Location = new Point(58, 5);
-            searchBox = Theme.TextBox("搜索实验名称");
-            searchBox.Location = new Point(10, 8);
-            searchBox.Width = 360;
-            searchBox.Height = 22;
-            searchBox.AutoSize = false;
-            searchBox.BorderStyle = BorderStyle.None;
-            searchBox.BackColor = Theme.Panel2;
-            searchBox.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            Theme.SetCueBanner(searchBox, "搜索实验名称");
-            DarkPanel searchShell = new DarkPanel { Location = new Point(0, 30), Width = 380, Height = 36, Radius = 9, BackColor = Theme.Panel2, Padding = new Padding(0), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            searchShell.Controls.Add(searchBox);
-            statusFilter = Theme.Button("全部状态   ▾", false);
-            statusFilter.Location = new Point(0, 75); statusFilter.Size = new Size(145, 34); statusFilter.AutoSize = false;
-            ContextMenuStrip statusMenu = new ContextMenuStrip { BackColor = Theme.Panel, ForeColor = Theme.Text, ShowImageMargin = false, Font = Theme.Font(8.8f, FontStyle.Regular) };
-            string[] statusNames = { "全部状态", "运行中", "已完成", "疑似卡住", "失败" };
-            for (int statusIndex = 0; statusIndex < statusNames.Length; statusIndex++)
-            {
-                int selectedIndex = statusIndex;
-                ToolStripMenuItem item = new ToolStripMenuItem(statusNames[statusIndex]);
-                item.Padding = new Padding(12, 7, 24, 7);
-                item.Click += delegate { statusFilterIndex = selectedIndex; statusFilter.Text = statusNames[selectedIndex] + "   ▾"; PopulateGrid(); };
-                statusMenu.Items.Add(item);
-            }
-            statusFilter.Click += delegate { statusMenu.Show(statusFilter, new Point(0, statusFilter.Height + 2)); };
-            favoriteOnly = new CheckBox { Text = "只看收藏", ForeColor = Theme.Text, AutoSize = true, Location = new Point(163, 77), BackColor = Theme.Panel };
-            filters.Controls.Add(libraryTitle);
-            filters.Controls.Add(libraryHint);
-            filters.Controls.Add(searchShell);
-            filters.Controls.Add(statusFilter);
-            filters.Controls.Add(favoriteOnly);
-
-            grid = new DataGridView();
-            ConfigureGrid(grid);
-            grid.Dock = DockStyle.Fill;
-            DataGridViewCheckBoxColumn select = new DataGridViewCheckBoxColumn { Name = "Compare", HeaderText = "对比", Width = 46 };
-            grid.Columns.Add(select);
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Favorite", HeaderText = "", Width = 28 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "实验", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 155 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", Width = 72 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Epoch", HeaderText = "Epoch", Width = 74 });
-            grid.CellValueChanged += GridCellValueChanged;
-            grid.CurrentCellDirtyStateChanged += delegate { if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
-            grid.SelectionChanged += GridSelectionChanged;
-
-            Panel listActions = new Panel { Dock = DockStyle.Bottom, Height = 60, BackColor = Theme.Panel };
-            compareButton = Theme.Button("对比已选实验", true);
-            compareButton.Location = new Point(0, 14);
-            compareButton.Height = 38;
-            compareButton.Click += OnCompare;
-            Label compareHint = Theme.Label("选择 2–5 条", 8, FontStyle.Regular, Theme.Muted);
-            compareHint.Location = new Point(154, 25);
-            listActions.Controls.Add(compareButton);
-            listActions.Controls.Add(compareHint);
-            listPanel.Controls.Add(grid);
-            listPanel.Controls.Add(filters);
-            listPanel.Controls.Add(listActions);
-            split.Panel1.Controls.Add(listPanel);
-
-            TableLayoutPanel detailRoot = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Theme.Back, RowCount = 2, ColumnCount = 1, Margin = new Padding(0), Padding = new Padding(0) };
-            detailRoot.RowStyles.Add(new RowStyle(SizeType.Absolute, 88));
-            detailRoot.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            TableLayoutPanel cards = new TableLayoutPanel { Dock = DockStyle.Top, Height = 88, ColumnCount = 3, BackColor = Theme.Back, Padding = new Padding(0, 0, 0, 10) };
-            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
-            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
-            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
-            runningCard = AddCard(cards, 0, "运行中", Theme.Cyan);
-            completedCard = AddCard(cards, 1, "已完成", Theme.Green);
-            stalledCard = AddCard(cards, 2, "需要关注", Theme.Amber);
-
-            TableLayoutPanel tabContainer = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Theme.Back, RowCount = 2, ColumnCount = 1, Margin = new Padding(0), Padding = new Padding(0) };
-            tabContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            tabContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            FlowLayoutPanel tabBar = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = Theme.Panel2, Padding = new Padding(4, 4, 0, 4), WrapContents = false };
-            Panel tabHost = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Back };
-            Panel overview = NewTab();
-            Panel metrics = NewTab();
-            Panel logs = NewTab();
-            Panel manage = NewTab();
-            Panel[] pages = { overview, metrics, logs, manage };
-            string[] pageNames = { "概览", "指标趋势", "实时日志", "管理" };
-            Button[] pageButtons = new Button[pages.Length];
-            Action<int> selectPage = delegate(int selected)
-            {
-                for (int i = 0; i < pages.Length; i++)
-                {
-                    pages[i].Visible = i == selected;
-                    pageButtons[i].BackColor = i == selected ? Color.FromArgb(40, 73, 116) : Theme.Panel2;
-                    pageButtons[i].FlatAppearance.BorderColor = i == selected ? Theme.Blue : Theme.Line;
-                    RoundButton round = pageButtons[i] as RoundButton;
-                    if (round != null) round.BorderColor = i == selected ? Theme.Blue : Theme.Line;
-                }
-            };
-            for (int i = 0; i < pages.Length; i++)
-            {
-                int pageIndex = i;
-                pages[i].Dock = DockStyle.Fill;
-                tabHost.Controls.Add(pages[i]);
-                pageButtons[i] = Theme.Button(pageNames[i], false);
-                pageButtons[i].Width = 112;
-                pageButtons[i].Height = 32;
-                pageButtons[i].Margin = new Padding(0, 0, 4, 0);
-                pageButtons[i].Click += delegate { selectPage(pageIndex); };
-                tabBar.Controls.Add(pageButtons[i]);
-            }
-            tabContainer.Controls.Add(tabBar, 0, 0);
-            tabContainer.Controls.Add(tabHost, 0, 1);
-            selectPage(0);
-            detailRoot.Controls.Add(cards, 0, 0);
-            detailRoot.Controls.Add(tabContainer, 0, 1);
-            split.Panel2.Controls.Add(detailRoot);
-
-            DarkPanel hero = new DarkPanel { Dock = DockStyle.Top, Height = 174, Padding = new Padding(18), Radius = 17, ShowAccent = true, AccentColor = Theme.Blue };
-            selectedTitle = Theme.Label("选择一条实验查看详情", 14, FontStyle.Bold, Theme.Text);
-            selectedTitle.Location = new Point(18, 16);
-            selectedTitle.AutoSize = false;
-            selectedTitle.Size = new Size(680, 34);
-            selectedTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            selectedTitle.AutoEllipsis = true;
-            selectedStatus = Theme.Label("—", 9, FontStyle.Bold, Theme.Muted);
-            selectedStatus.Location = new Point(20, 60);
-            progress = new ModernProgress { Location = new Point(20, 91), Height = 11, Width = 690, Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Maximum = 1000, AccentColor = Theme.Cyan };
-            TableLayoutPanel heroStats = new TableLayoutPanel { Location = new Point(16, 112), Height = 46, Width = 700, Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, ColumnCount = 3 };
-            heroStats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-            heroStats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-            heroStats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-            epochValue = AddHeroStat(heroStats, 0, "Epoch");
-            batchValue = AddHeroStat(heroStats, 1, "Batch");
-            timeValue = AddHeroStat(heroStats, 2, "耗时 / ETA");
-            hero.Controls.Add(selectedTitle);
-            hero.Controls.Add(selectedStatus);
-            hero.Controls.Add(progress);
-            hero.Controls.Add(heroStats);
-            SplitContainer overviewSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, BackColor = Theme.Line, Padding = new Padding(0, 10, 0, 0), SplitterWidth = 10 };
-            DarkPanel metricPanel = new DarkPanel { Dock = DockStyle.Fill, Radius = 16, ShowAccent = true, AccentColor = Theme.Cyan };
-            DarkPanel hostPanel = new DarkPanel { Dock = DockStyle.Fill, Radius = 16, ShowAccent = true, AccentColor = Theme.Purple };
-            metricPanel.Controls.Add(Theme.Label("最新指标", 10, FontStyle.Bold, Theme.Text));
-            metricsText = Theme.Label("尚无指标", 9, FontStyle.Regular, Theme.Muted);
-            metricsText.Location = new Point(14, 48);
-            metricsText.MaximumSize = new Size(355, 1000);
-            metricPanel.Controls.Add(metricsText);
-            hostPanel.Controls.Add(Theme.Label("GPU / 主机状态", 10, FontStyle.Bold, Theme.Text));
-            hostText = new RichTextBox { Text = "训练端尚未上报硬件状态", Location = new Point(16, 46), ReadOnly = true, BorderStyle = BorderStyle.None, BackColor = Theme.Panel, ForeColor = Theme.Muted, Font = Theme.Font(8.8f, FontStyle.Regular), WordWrap = true, DetectUrls = false, ScrollBars = RichTextBoxScrollBars.Vertical, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
-            hostPanel.Resize += delegate { hostText.Size = new Size(Math.Max(40, hostPanel.ClientSize.Width - 31), Math.Max(40, hostPanel.ClientSize.Height - 60)); };
-            hostPanel.Controls.Add(hostText);
-            overviewSplit.Panel1.Controls.Add(metricPanel);
-            overviewSplit.Panel2.Controls.Add(hostPanel);
-            overviewSplit.Resize += delegate
-            {
-                int width = overviewSplit.ClientSize.Width;
-                if (width < 620) return;
-                int desired = (int)(width * .66);
-                desired = Math.Max(320, Math.Min(desired, width - 290));
-                if (desired > 0 && desired < width - overviewSplit.SplitterWidth)
-                    overviewSplit.SplitterDistance = desired;
-            };
-            TableLayoutPanel overviewLayout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = new Padding(0), Padding = new Padding(0), BackColor = Theme.Back };
-            overviewLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 174));
-            overviewLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            overviewLayout.Controls.Add(hero, 0, 0);
-            overviewLayout.Controls.Add(overviewSplit, 0, 1);
-            overview.Controls.Add(overviewLayout);
-
-            Panel chartToolbar = new Panel { Dock = DockStyle.Top, Height = 55, BackColor = Theme.Panel };
-            chartToolbar.Controls.Add(Theme.Label("指标", 9, FontStyle.Bold, Theme.Muted));
-            metricSelector = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, BackColor = Theme.Panel2, ForeColor = Theme.Text, FlatStyle = FlatStyle.Flat, Location = new Point(52, 8), Width = 310 };
-            Theme.StyleComboBox(metricSelector);
-            metricSelector.SelectedIndexChanged += delegate { RenderMetricChart(); };
-            bestText = Theme.Label("选择实验后显示最佳 Epoch", 8.5f, FontStyle.Regular, Theme.Muted);
-            bestText.Location = new Point(380, 12);
-            chartToolbar.Controls.Add(metricSelector);
-            chartToolbar.Controls.Add(bestText);
-            chart = new TrendChart { Dock = DockStyle.Fill, BackColor = Theme.Panel2 };
-            metrics.Controls.Add(chart);
-            metrics.Controls.Add(chartToolbar);
-
-            logText = new RichTextBox { Dock = DockStyle.Fill, ReadOnly = true, BackColor = Color.FromArgb(8, 14, 27), ForeColor = Color.FromArgb(195, 215, 238), BorderStyle = BorderStyle.None, Font = new Font("Consolas", 9.5f), WordWrap = false };
-            logs.Padding = new Padding(12);
-            logs.Controls.Add(logText);
-
-            TableLayoutPanel manageLayout = new TableLayoutPanel { Dock = DockStyle.Top, Height = 335, Padding = new Padding(18), ColumnCount = 2, RowCount = 6 };
-            manageLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
-            manageLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
-            manageLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 55));
-            groupBox = Theme.TextBox("实验分组"); groupBox.Dock = DockStyle.Fill;
-            tagsBox = Theme.TextBox("标签，逗号分隔"); tagsBox.Dock = DockStyle.Fill;
-            favoriteBox = new CheckBox { Text = "收藏这条实验", ForeColor = Theme.Text, AutoSize = true, BackColor = Theme.Back };
-            saveButton = Theme.Button("保存分组 / 标签 / 收藏", true);
-            notesButton = Theme.Button("编辑实验假设 / 结论 / 下一步", false);
-            deleteButton = Theme.Button("永久删除实验", false);
-            deleteButton.BackColor = Color.FromArgb(129, 39, 57);
-            deleteButton.FlatAppearance.BorderColor = Theme.Red;
-            saveButton.Click += OnSaveMetadata;
-            notesButton.Click += OnEditNotes;
-            deleteButton.Click += OnDelete;
-            manageLayout.Controls.Add(Theme.Label("实验分组", 9, FontStyle.Bold, Theme.Muted), 0, 0); manageLayout.Controls.Add(groupBox, 1, 0);
-            manageLayout.Controls.Add(Theme.Label("实验标签", 9, FontStyle.Bold, Theme.Muted), 0, 1); manageLayout.Controls.Add(tagsBox, 1, 1);
-            manageLayout.Controls.Add(Theme.Label("重要实验", 9, FontStyle.Bold, Theme.Muted), 0, 2); manageLayout.Controls.Add(favoriteBox, 1, 2);
-            manageLayout.Controls.Add(Theme.Label("实验笔记", 9, FontStyle.Bold, Theme.Muted), 0, 3); manageLayout.Controls.Add(notesButton, 1, 3);
-            manageLayout.Controls.Add(Theme.Label("管理操作", 9, FontStyle.Bold, Theme.Muted), 0, 4); manageLayout.Controls.Add(saveButton, 1, 4);
-            manageLayout.Controls.Add(Theme.Label("危险区域", 9, FontStyle.Bold, Theme.Red), 0, 5); manageLayout.Controls.Add(deleteButton, 1, 5);
-            manage.Controls.Add(manageLayout);
-            Label securityHint = Theme.Label("浏览无需密码；保存、收藏和删除会在操作时单独要求管理员密码，密码不会保存在本机。", 8.5f, FontStyle.Regular, Theme.Muted);
-            securityHint.Location = new Point(22, 355);
-            manage.Controls.Add(securityHint);
 
             searchBox.TextChanged += delegate { PopulateGrid(); };
             favoriteOnly.CheckedChanged += delegate { PopulateGrid(); };
@@ -384,6 +113,599 @@ namespace YoloMonitorPet
             }
             FormClosed += delegate { if (state != null) state.Updated -= StateUpdated; };
             SetManagementEnabled(false);
+        }
+
+        private Control BuildHeader()
+        {
+            Panel header = new Panel();
+            header.Dock = DockStyle.Fill;
+            header.BackColor = Theme.Panel2;
+            header.Padding = new Padding(24, 0, 12, 0);
+            header.MouseDown += DragWindow;
+            header.DoubleClick += delegate { ToggleMaximize(); };
+
+            Label mark = Theme.Label("Y", 13, FontStyle.Bold, Color.White);
+            mark.TextAlign = ContentAlignment.MiddleCenter;
+            mark.AutoSize = false;
+            mark.Size = new Size(42, 42);
+            mark.Location = new Point(24, 18);
+            mark.BackColor = Theme.Blue;
+            mark.MouseDown += DragWindow;
+
+            Label title = Theme.Label("EPOCH STUDIO", 14.5f, FontStyle.Bold, Theme.Text);
+            title.Location = new Point(79, 15);
+            title.MouseDown += DragWindow;
+            Label subtitle = Theme.Label("YOLO EXPERIMENT OPERATIONS", 7.2f, FontStyle.Bold, Theme.Muted);
+            subtitle.Location = new Point(81, 42);
+            subtitle.MouseDown += DragWindow;
+            connectionLabel = Theme.Label("● 正在连接", 8.2f, FontStyle.Regular, Theme.Muted);
+            connectionLabel.Location = new Point(287, 29);
+
+            FlowLayoutPanel actions = new FlowLayoutPanel();
+            actions.Dock = DockStyle.Right;
+            actions.Width = 770;
+            actions.Height = 78;
+            actions.Padding = new Padding(0, 18, 0, 0);
+            actions.FlowDirection = FlowDirection.RightToLeft;
+            actions.WrapContents = false;
+            actions.BackColor = Theme.Panel2;
+
+            Button close = HeaderButton("×", 40);
+            Button maximize = HeaderButton("□", 40);
+            Button minimize = HeaderButton("—", 40);
+            close.ForeColor = Theme.Red;
+            close.Click += delegate { Close(); };
+            maximize.Click += delegate { ToggleMaximize(); };
+            minimize.Click += delegate { WindowState = FormWindowState.Minimized; };
+
+            Button style = HeaderButton("风格 · " + Theme.ModeDisplayName + "  ▾", 138);
+            ContextMenuStrip styleMenu = BuildStyleMenu();
+            style.Click += delegate { styleMenu.Show(style, new Point(0, style.Height + 5)); };
+
+            Button server = HeaderButton("服务器", 82);
+            server.Click += OnServerSettings;
+            updateButton = HeaderButton("检查更新", 92);
+            updateButton.Click += async delegate
+            {
+                if (state == null) return;
+                updateButton.Enabled = false;
+                await UpdateWorkflow.CheckAndPromptAsync(this, settings.ServerUrl, false, delegate(string text) { updateButton.Text = text; });
+                updateButton.Enabled = true;
+            };
+            Button refresh = HeaderButton("刷新", 72);
+            refresh.Click += async delegate { if (state != null) await state.RefreshAsync(); };
+            Button queue = Theme.Button("实验队列", true);
+            queue.AutoSize = false;
+            queue.Size = new Size(96, 40);
+            queue.Margin = new Padding(6, 0, 6, 0);
+            queue.Click += delegate { if (state != null) new QueueForm(state.Api).Show(this); };
+
+            actions.Controls.Add(close);
+            actions.Controls.Add(maximize);
+            actions.Controls.Add(minimize);
+            actions.Controls.Add(style);
+            actions.Controls.Add(server);
+            actions.Controls.Add(updateButton);
+            actions.Controls.Add(refresh);
+            actions.Controls.Add(queue);
+
+            header.Controls.Add(actions);
+            header.Controls.Add(mark);
+            header.Controls.Add(title);
+            header.Controls.Add(subtitle);
+            header.Controls.Add(connectionLabel);
+            return header;
+        }
+
+        private Button HeaderButton(string text, int width)
+        {
+            Button button = Theme.Button(text, false);
+            button.AutoSize = false;
+            button.Size = new Size(width, 40);
+            button.Margin = new Padding(3, 0, 3, 0);
+            return button;
+        }
+
+        private ContextMenuStrip BuildStyleMenu()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.BackColor = Theme.Panel;
+            menu.ForeColor = Theme.Text;
+            menu.ShowImageMargin = false;
+            menu.Font = Theme.Font(9, FontStyle.Regular);
+            AddStyleItem(menu, "Material Design", "material");
+            AddStyleItem(menu, "Claymorphism", "clay");
+            AddStyleItem(menu, "Elegant", "elegant");
+            return menu;
+        }
+
+        private void AddStyleItem(ContextMenuStrip menu, string text, string key)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(text);
+            item.Checked = Theme.ModeKey == key;
+            item.Padding = new Padding(14, 8, 24, 8);
+            item.Click += delegate
+            {
+                settings.VisualStyle = key;
+                settings.Save();
+                Theme.Use(key);
+                EventHandler handler = VisualStyleChanged;
+                if (handler != null) handler(this, EventArgs.Empty);
+            };
+            menu.Items.Add(item);
+        }
+
+        private Control BuildWorkspace()
+        {
+            SplitContainer split = new SplitContainer();
+            split.Dock = DockStyle.Fill;
+            split.BackColor = Theme.Back;
+            split.SplitterWidth = 10;
+            split.Panel1.BackColor = Theme.Back;
+            split.Panel2.BackColor = Theme.Back;
+            split.Panel1.Padding = new Padding(18, 14, 5, 18);
+            split.Panel2.Padding = new Padding(5, 14, 18, 18);
+            split.Panel1.Controls.Add(BuildLibrary());
+            split.Panel2.Controls.Add(BuildDetails());
+            Shown += delegate
+            {
+                int desired = Math.Max(330, Math.Min(410, (int)(split.ClientSize.Width * .29)));
+                if (desired < split.ClientSize.Width - 640) split.SplitterDistance = desired;
+            };
+            return split;
+        }
+
+        private Control BuildLibrary()
+        {
+            DarkPanel panel = new DarkPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.Padding = new Padding(18);
+            panel.Radius = Theme.CardRadius;
+
+            Panel filters = new Panel();
+            filters.Dock = DockStyle.Top;
+            filters.Height = 148;
+            filters.BackColor = Theme.Panel;
+
+            Label eyebrow = Theme.Label("EXPERIMENT LIBRARY", 7.2f, FontStyle.Bold, Theme.Blue);
+            eyebrow.Location = new Point(1, 0);
+            Label title = Theme.Label("实验库", 13, FontStyle.Bold, Theme.Text);
+            title.Location = new Point(0, 18);
+
+            DarkPanel searchShell = new DarkPanel();
+            searchShell.Location = new Point(0, 52);
+            searchShell.Height = 42;
+            searchShell.Width = 340;
+            searchShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            searchShell.Radius = Theme.ButtonRadius;
+            searchShell.BackColor = Theme.Input;
+            searchShell.Padding = new Padding(12, 9, 12, 8);
+            searchBox = Theme.TextBox("");
+            searchBox.BorderStyle = BorderStyle.None;
+            searchBox.Dock = DockStyle.Fill;
+            searchBox.BackColor = Theme.Input;
+            Theme.SetCueBanner(searchBox, "搜索实验名称");
+            searchShell.Controls.Add(searchBox);
+
+            statusFilter = Theme.Button("全部状态  ▾", false);
+            statusFilter.AutoSize = false;
+            statusFilter.Size = new Size(138, 38);
+            statusFilter.Location = new Point(0, 105);
+            ContextMenuStrip statusMenu = new ContextMenuStrip();
+            statusMenu.BackColor = Theme.Panel;
+            statusMenu.ForeColor = Theme.Text;
+            statusMenu.ShowImageMargin = false;
+            statusMenu.Font = Theme.Font(8.8f, FontStyle.Regular);
+            string[] statusNames = { "全部状态", "运行中", "已完成", "疑似卡住", "失败" };
+            for (int i = 0; i < statusNames.Length; i++)
+            {
+                int index = i;
+                ToolStripMenuItem item = new ToolStripMenuItem(statusNames[i]);
+                item.Padding = new Padding(12, 7, 24, 7);
+                item.Click += delegate
+                {
+                    statusFilterIndex = index;
+                    statusFilter.Text = statusNames[index] + "  ▾";
+                    PopulateGrid();
+                };
+                statusMenu.Items.Add(item);
+            }
+            statusFilter.Click += delegate { statusMenu.Show(statusFilter, new Point(0, statusFilter.Height + 4)); };
+            favoriteOnly = new CheckBox();
+            favoriteOnly.Text = "只看收藏";
+            favoriteOnly.ForeColor = Theme.Text;
+            favoriteOnly.BackColor = Theme.Panel;
+            favoriteOnly.AutoSize = true;
+            favoriteOnly.Location = new Point(158, 115);
+
+            filters.Controls.Add(eyebrow);
+            filters.Controls.Add(title);
+            filters.Controls.Add(searchShell);
+            filters.Controls.Add(statusFilter);
+            filters.Controls.Add(favoriteOnly);
+
+            grid = new DataGridView();
+            ConfigureGrid(grid);
+            grid.Dock = DockStyle.Fill;
+            grid.ScrollBars = ScrollBars.Vertical;
+            grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Compare", HeaderText = "选", Width = 32 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Favorite", HeaderText = "", Width = 22 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "实验", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, MinimumWidth = 92 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "状态", Width = 64 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Epoch", HeaderText = "Epoch", Width = 61 });
+            grid.CellValueChanged += GridCellValueChanged;
+            grid.CurrentCellDirtyStateChanged += delegate { if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            grid.SelectionChanged += GridSelectionChanged;
+
+            Panel footer = new Panel();
+            footer.Dock = DockStyle.Bottom;
+            footer.Height = 68;
+            footer.BackColor = Theme.Panel;
+            compareButton = Theme.Button("对比已选实验", true);
+            compareButton.AutoSize = false;
+            compareButton.Size = new Size(148, 42);
+            compareButton.Location = new Point(0, 15);
+            compareButton.Click += OnCompare;
+            Label hint = Theme.Label("选择 2–5 条实验", 7.8f, FontStyle.Regular, Theme.Muted);
+            hint.Location = new Point(162, 28);
+            footer.Controls.Add(compareButton);
+            footer.Controls.Add(hint);
+
+            panel.Controls.Add(grid);
+            panel.Controls.Add(filters);
+            panel.Controls.Add(footer);
+            return panel;
+        }
+
+        private Control BuildDetails()
+        {
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.RowCount = 2;
+            root.ColumnCount = 1;
+            root.Margin = new Padding(0);
+            root.Padding = new Padding(0);
+            root.BackColor = Theme.Back;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            TableLayoutPanel cards = new TableLayoutPanel();
+            cards.Dock = DockStyle.Fill;
+            cards.ColumnCount = 3;
+            cards.BackColor = Theme.Back;
+            cards.Padding = new Padding(0, 0, 0, 10);
+            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
+            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
+            cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.334f));
+            runningCard = AddCard(cards, 0, "RUNNING", "运行中", Theme.Cyan);
+            completedCard = AddCard(cards, 1, "COMPLETED", "已完成", Theme.Green);
+            stalledCard = AddCard(cards, 2, "ATTENTION", "需要关注", Theme.Amber);
+
+            TableLayoutPanel tabs = new TableLayoutPanel();
+            tabs.Dock = DockStyle.Fill;
+            tabs.RowCount = 2;
+            tabs.ColumnCount = 1;
+            tabs.Margin = new Padding(0);
+            tabs.Padding = new Padding(0);
+            tabs.BackColor = Theme.Back;
+            tabs.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
+            tabs.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            FlowLayoutPanel tabBar = new FlowLayoutPanel();
+            tabBar.Dock = DockStyle.Fill;
+            tabBar.BackColor = Theme.Back;
+            tabBar.Padding = new Padding(0, 4, 0, 5);
+            tabBar.WrapContents = false;
+            Panel tabHost = new Panel();
+            tabHost.Dock = DockStyle.Fill;
+            tabHost.BackColor = Theme.Back;
+
+            Panel overview = NewTab();
+            Panel metrics = NewTab();
+            Panel logs = NewTab();
+            Panel manage = NewTab();
+            BuildOverview(overview);
+            BuildMetrics(metrics);
+            BuildLogs(logs);
+            BuildManage(manage);
+            Panel[] pages = { overview, metrics, logs, manage };
+            string[] names = { "概览", "指标趋势", "实时日志", "实验管理" };
+            Button[] buttons = new Button[pages.Length];
+            Action<int> select = delegate(int selected)
+            {
+                for (int i = 0; i < pages.Length; i++)
+                {
+                    bool active = i == selected;
+                    pages[i].Visible = active;
+                    buttons[i].BackColor = active ? Theme.Blue : Theme.Raised;
+                    buttons[i].ForeColor = active ? Color.White : Theme.Muted;
+                    RoundButton round = buttons[i] as RoundButton;
+                    if (round != null)
+                    {
+                        round.Primary = active;
+                        round.BorderColor = active ? Theme.Blue : Theme.Line;
+                    }
+                }
+            };
+            for (int i = 0; i < pages.Length; i++)
+            {
+                int index = i;
+                pages[i].Dock = DockStyle.Fill;
+                tabHost.Controls.Add(pages[i]);
+                buttons[i] = Theme.Button(names[i], false);
+                buttons[i].AutoSize = false;
+                buttons[i].Size = new Size(120, 40);
+                buttons[i].Margin = new Padding(0, 0, 8, 0);
+                buttons[i].Click += delegate { select(index); };
+                tabBar.Controls.Add(buttons[i]);
+            }
+            select(0);
+            tabs.Controls.Add(tabBar, 0, 0);
+            tabs.Controls.Add(tabHost, 0, 1);
+            root.Controls.Add(cards, 0, 0);
+            root.Controls.Add(tabs, 0, 1);
+            return root;
+        }
+
+        private void BuildOverview(Panel page)
+        {
+            DarkPanel hero = new DarkPanel();
+            hero.Dock = DockStyle.Top;
+            hero.Height = 194;
+            hero.Padding = new Padding(22);
+            hero.ShowAccent = true;
+            hero.AccentColor = Theme.Blue;
+
+            Label eyebrow = Theme.Label("SELECTED EXPERIMENT", 7.2f, FontStyle.Bold, Theme.Blue);
+            eyebrow.Location = new Point(22, 22);
+            selectedTitle = Theme.Label("选择一条实验查看详情", 15, FontStyle.Bold, Theme.Text);
+            selectedTitle.AutoSize = false;
+            selectedTitle.Location = new Point(22, 44);
+            selectedTitle.Size = new Size(690, 34);
+            selectedTitle.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            selectedTitle.AutoEllipsis = true;
+            selectedStatus = Theme.Label("从左侧实验库开始", 8.5f, FontStyle.Regular, Theme.Muted);
+            selectedStatus.Location = new Point(23, 79);
+            selectedStatusPill = new StatusPill();
+            selectedStatusPill.Location = new Point(715, 29);
+            selectedStatusPill.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            selectedStatusPill.Status = "";
+            progress = new ModernProgress();
+            progress.Location = new Point(23, 108);
+            progress.Width = 780;
+            progress.Height = 12;
+            progress.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            progress.Maximum = 1000;
+            progress.AccentColor = Theme.Cyan;
+
+            TableLayoutPanel stats = new TableLayoutPanel();
+            stats.Location = new Point(18, 134);
+            stats.Height = 48;
+            stats.Width = 795;
+            stats.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            stats.ColumnCount = 3;
+            stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+            stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+            stats.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34f));
+            epochValue = AddHeroStat(stats, 0, "EPOCH");
+            batchValue = AddHeroStat(stats, 1, "BATCH");
+            timeValue = AddHeroStat(stats, 2, "ELAPSED / ETA");
+
+            hero.Controls.Add(eyebrow);
+            hero.Controls.Add(selectedTitle);
+            hero.Controls.Add(selectedStatus);
+            hero.Controls.Add(selectedStatusPill);
+            hero.Controls.Add(progress);
+            hero.Controls.Add(stats);
+            hero.Resize += delegate
+            {
+                int innerWidth = Math.Max(280, hero.ClientSize.Width - 46);
+                selectedStatusPill.Left = Math.Max(24, hero.ClientSize.Width - selectedStatusPill.Width - 24);
+                selectedTitle.Width = Math.Max(180, innerWidth - selectedStatusPill.Width - 22);
+                progress.Width = innerWidth;
+                stats.Width = innerWidth + 10;
+            };
+
+            SplitContainer lower = new SplitContainer();
+            lower.Dock = DockStyle.Fill;
+            lower.Orientation = Orientation.Vertical;
+            lower.BackColor = Theme.Back;
+            lower.Padding = new Padding(0, 12, 0, 0);
+            lower.SplitterWidth = 12;
+
+            DarkPanel metricPanel = SectionPanel("LATEST METRICS", "最新训练与验证指标", Theme.Cyan);
+            metricsText = Theme.Label("尚无指标", 9, FontStyle.Regular, Theme.Muted);
+            metricsText.Location = new Point(22, 70);
+            metricsText.MaximumSize = new Size(540, 1000);
+            metricPanel.Controls.Add(metricsText);
+
+            DarkPanel hostPanel = SectionPanel("HARDWARE TELEMETRY", "GPU / 主机状态", Theme.Purple);
+            hostText = new RichTextBox();
+            hostText.Text = "训练端尚未上报硬件状态";
+            hostText.Location = new Point(22, 70);
+            hostText.ReadOnly = true;
+            hostText.BorderStyle = BorderStyle.None;
+            hostText.BackColor = Theme.Panel;
+            hostText.ForeColor = Theme.Muted;
+            hostText.Font = Theme.Font(8.8f, FontStyle.Regular);
+            hostText.WordWrap = true;
+            hostText.DetectUrls = false;
+            hostText.ScrollBars = RichTextBoxScrollBars.Vertical;
+            hostText.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            hostPanel.Resize += delegate { hostText.Size = new Size(Math.Max(40, hostPanel.ClientSize.Width - 44), Math.Max(40, hostPanel.ClientSize.Height - 92)); };
+            hostPanel.Controls.Add(hostText);
+            lower.Panel1.Controls.Add(metricPanel);
+            lower.Panel2.Controls.Add(hostPanel);
+            lower.Resize += delegate
+            {
+                int width = lower.ClientSize.Width;
+                if (width < 650) return;
+                int desired = Math.Max(330, Math.Min((int)(width * .61), width - 300));
+                if (desired > 0 && desired < width - lower.SplitterWidth) lower.SplitterDistance = desired;
+            };
+
+            page.Controls.Add(lower);
+            page.Controls.Add(hero);
+        }
+
+        private void BuildMetrics(Panel page)
+        {
+            DarkPanel panel = SectionPanel("EPOCH ANALYTICS", "指标趋势与最佳 Epoch", Theme.Cyan);
+            panel.Dock = DockStyle.Fill;
+            Panel toolbar = new Panel();
+            toolbar.Dock = DockStyle.Top;
+            toolbar.Height = 74;
+            toolbar.BackColor = Theme.Panel;
+            metricSelector = new ComboBox();
+            metricSelector.DropDownStyle = ComboBoxStyle.DropDownList;
+            metricSelector.Location = new Point(22, 35);
+            metricSelector.Width = 330;
+            Theme.StyleComboBox(metricSelector);
+            metricSelector.SelectedIndexChanged += delegate { RenderMetricChart(); };
+            bestText = Theme.Label("选择实验后显示最佳 Epoch", 8.5f, FontStyle.Regular, Theme.Muted);
+            bestText.Location = new Point(375, 39);
+            toolbar.Controls.Add(metricSelector);
+            toolbar.Controls.Add(bestText);
+            chart = new TrendChart();
+            chart.Dock = DockStyle.Fill;
+            chart.BackColor = Theme.Panel;
+            chart.Padding = new Padding(12);
+            panel.Controls.Add(chart);
+            panel.Controls.Add(toolbar);
+            page.Controls.Add(panel);
+        }
+
+        private void BuildLogs(Panel page)
+        {
+            DarkPanel panel = SectionPanel("LIVE OUTPUT", "训练日志尾部", Theme.Green);
+            panel.Dock = DockStyle.Fill;
+            Panel spacer = new Panel { Dock = DockStyle.Top, Height = 65, BackColor = Theme.Panel };
+            logText = new RichTextBox();
+            logText.Dock = DockStyle.Fill;
+            logText.ReadOnly = true;
+            logText.BackColor = Theme.Input;
+            logText.ForeColor = Theme.Mode == VisualStyleMode.Clay ? Theme.Text : Color.FromArgb(197, 216, 236);
+            logText.BorderStyle = BorderStyle.None;
+            logText.Font = new Font("Consolas", 9.5f);
+            logText.WordWrap = false;
+            logText.Margin = new Padding(20);
+            Panel logShell = new Panel { Dock = DockStyle.Fill, Padding = new Padding(20, 0, 20, 20), BackColor = Theme.Panel };
+            logShell.Controls.Add(logText);
+            panel.Controls.Add(logShell);
+            panel.Controls.Add(spacer);
+            page.Controls.Add(panel);
+        }
+
+        private void BuildManage(Panel page)
+        {
+            DarkPanel panel = SectionPanel("EXPERIMENT MANAGEMENT", "分组、标签、笔记和危险操作", Theme.Amber);
+            panel.Dock = DockStyle.Fill;
+            TableLayoutPanel form = new TableLayoutPanel();
+            form.Dock = DockStyle.Top;
+            form.Height = 355;
+            form.Padding = new Padding(22, 68, 22, 10);
+            form.BackColor = Theme.Panel;
+            form.ColumnCount = 2;
+            form.RowCount = 6;
+            form.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
+            form.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            form.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+
+            groupBox = Theme.TextBox("实验分组");
+            tagsBox = Theme.TextBox("标签，逗号分隔");
+            groupBox.Dock = DockStyle.Fill;
+            tagsBox.Dock = DockStyle.Fill;
+            favoriteBox = new CheckBox { Text = "收藏这条实验", ForeColor = Theme.Text, AutoSize = true, BackColor = Theme.Panel };
+            notesButton = Theme.Button("编辑实验假设 / 结论 / 下一步", false);
+            saveButton = Theme.Button("保存管理信息", true);
+            deleteButton = Theme.Button("永久删除实验", false);
+            deleteButton.BackColor = Theme.Red;
+            deleteButton.ForeColor = Color.White;
+            RoundButton deleteRound = deleteButton as RoundButton;
+            if (deleteRound != null) deleteRound.BorderColor = Theme.Red;
+            saveButton.Click += OnSaveMetadata;
+            notesButton.Click += OnEditNotes;
+            deleteButton.Click += OnDelete;
+
+            AddManageRow(form, 0, "实验分组", groupBox, Theme.Muted);
+            AddManageRow(form, 1, "实验标签", tagsBox, Theme.Muted);
+            AddManageRow(form, 2, "重要实验", favoriteBox, Theme.Muted);
+            AddManageRow(form, 3, "实验笔记", notesButton, Theme.Muted);
+            AddManageRow(form, 4, "保存修改", saveButton, Theme.Muted);
+            AddManageRow(form, 5, "危险区域", deleteButton, Theme.Red);
+            Label security = Theme.Label("浏览无需密码；写入和删除操作会单独验证管理员密码，密码不会保存到本机。", 8.3f, FontStyle.Regular, Theme.Muted);
+            security.Location = new Point(23, 371);
+            panel.Controls.Add(security);
+            panel.Controls.Add(form);
+            page.Controls.Add(panel);
+        }
+
+        private static void AddManageRow(TableLayoutPanel form, int row, string text, Control control, Color color)
+        {
+            Label label = Theme.Label(text, 8.8f, FontStyle.Bold, color);
+            label.Dock = DockStyle.Fill;
+            label.TextAlign = ContentAlignment.MiddleLeft;
+            control.Dock = DockStyle.Fill;
+            control.Margin = new Padding(4, 5, 4, 5);
+            form.Controls.Add(label, 0, row);
+            form.Controls.Add(control, 1, row);
+        }
+
+        private static DarkPanel SectionPanel(string eyebrowText, string titleText, Color accent)
+        {
+            DarkPanel panel = new DarkPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.ShowAccent = true;
+            panel.AccentColor = accent;
+            Label eyebrow = Theme.Label(eyebrowText, 7.1f, FontStyle.Bold, accent);
+            eyebrow.Location = new Point(22, 24);
+            Label title = Theme.Label(titleText, 11, FontStyle.Bold, Theme.Text);
+            title.Location = new Point(21, 43);
+            panel.Controls.Add(eyebrow);
+            panel.Controls.Add(title);
+            return panel;
+        }
+
+        private static Panel NewTab()
+        {
+            return new Panel { BackColor = Theme.Back, ForeColor = Theme.Text, Padding = new Padding(0), Visible = false };
+        }
+
+        private static Label AddCard(TableLayoutPanel cards, int column, string eyebrow, string caption, Color color)
+        {
+            DarkPanel panel = new DarkPanel();
+            panel.Dock = DockStyle.Fill;
+            panel.Margin = new Padding(column == 0 ? 0 : 6, 0, column == 2 ? 0 : 6, 0);
+            panel.ShowAccent = true;
+            panel.AccentColor = color;
+            Label small = Theme.Label(eyebrow, 7.1f, FontStyle.Bold, color);
+            small.Location = new Point(20, 22);
+            Label value = Theme.Label("0", 18, FontStyle.Bold, Theme.Text);
+            value.Location = new Point(18, 42);
+            Label name = Theme.Label(caption, 8, FontStyle.Regular, Theme.Muted);
+            name.Location = new Point(62, 51);
+            panel.Controls.Add(small);
+            panel.Controls.Add(value);
+            panel.Controls.Add(name);
+            cards.Controls.Add(panel, column, 0);
+            return value;
+        }
+
+        private static Label AddHeroStat(TableLayoutPanel layout, int column, string caption)
+        {
+            Panel panel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
+            Label value = Theme.Label("—", 10, FontStyle.Bold, Theme.Text);
+            value.Location = new Point(5, 0);
+            Label label = Theme.Label(caption, 7, FontStyle.Bold, Theme.Muted);
+            label.Location = new Point(5, 25);
+            panel.Controls.Add(value);
+            panel.Controls.Add(label);
+            layout.Controls.Add(panel, column, 0);
+            return value;
         }
 
         private static void ConfigureGrid(DataGridView view)
@@ -399,13 +721,38 @@ namespace YoloMonitorPet
             view.GridColor = Theme.Line;
             view.CellBorderStyle = DataGridViewCellBorderStyle.None;
             view.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
-            view.ColumnHeadersHeight = 38;
+            view.ColumnHeadersHeight = 42;
             view.EnableHeadersVisualStyles = false;
-            view.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle { BackColor = Theme.Panel2, ForeColor = Theme.Muted, Font = Theme.Font(8.2f, FontStyle.Bold), SelectionBackColor = Theme.Panel2, Padding = new Padding(4, 0, 4, 0) };
-            view.DefaultCellStyle = new DataGridViewCellStyle { BackColor = Theme.Panel, ForeColor = Theme.Text, SelectionBackColor = Color.FromArgb(29, 43, 70), SelectionForeColor = Color.White, Padding = new Padding(5, 4, 5, 4) };
-            view.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Color.FromArgb(13, 21, 38), ForeColor = Theme.Text, SelectionBackColor = Color.FromArgb(29, 43, 70), SelectionForeColor = Color.White };
-            view.RowTemplate.Height = 52;
+            view.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Theme.Panel,
+                ForeColor = Theme.Muted,
+                Font = Theme.Font(7.8f, FontStyle.Bold),
+                SelectionBackColor = Theme.Panel,
+                Padding = new Padding(5, 0, 5, 0)
+            };
+            view.DefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Theme.Panel,
+                ForeColor = Theme.Text,
+                SelectionBackColor = Theme.Selection,
+                SelectionForeColor = Theme.Text,
+                Padding = new Padding(6, 5, 6, 5)
+            };
+            view.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Theme.Panel2,
+                ForeColor = Theme.Text,
+                SelectionBackColor = Theme.Selection,
+                SelectionForeColor = Theme.Text
+            };
+            view.RowTemplate.Height = 56;
             view.RowTemplate.DividerHeight = 1;
+        }
+
+        private void ToggleMaximize()
+        {
+            WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
         }
 
         private void DragWindow(object sender, MouseEventArgs e)
@@ -433,27 +780,6 @@ namespace YoloMonitorPet
                 if (point.Y >= ClientSize.Height - grip) { message.Result = (IntPtr)15; return; }
             }
             base.WndProc(ref message);
-        }
-
-        private static Panel NewTab() { return new Panel { BackColor = Theme.Back, ForeColor = Theme.Text, Padding = new Padding(10), Visible = false }; }
-
-        private static Label AddCard(TableLayoutPanel cards, int column, string caption, Color color)
-        {
-            DarkPanel panel = new DarkPanel { Dock = DockStyle.Fill, Margin = new Padding(column == 0 ? 0 : 6, 0, column == 2 ? 0 : 6, 0), Padding = new Padding(16, 10, 16, 8), Radius = 15, ShowAccent = true, AccentColor = color };
-            Label label = Theme.Label("0", 18, FontStyle.Bold, color);
-            label.Location = new Point(21, 9);
-            Label name = Theme.Label(caption, 8.5f, FontStyle.Regular, Theme.Muted);
-            name.Location = new Point(23, 46);
-            panel.Controls.Add(label); panel.Controls.Add(name); cards.Controls.Add(panel, column, 0);
-            return label;
-        }
-
-        private static Label AddHeroStat(TableLayoutPanel layout, int column, string caption)
-        {
-            Panel panel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
-            Label value = Theme.Label("—", 10, FontStyle.Bold, Theme.Text); value.Location = new Point(4, 0);
-            Label label = Theme.Label(caption, 7.5f, FontStyle.Regular, Theme.Muted); label.Location = new Point(4, 23);
-            panel.Controls.Add(value); panel.Controls.Add(label); layout.Controls.Add(panel, column, 0); return value;
         }
 
         private void StateUpdated(object sender, EventArgs e)
@@ -498,16 +824,16 @@ namespace YoloMonitorPet
             });
             populatingGrid = true;
             grid.Rows.Clear();
-            int selectRow = -1;
+            int selectedRow = -1;
             foreach (Dictionary<string, object> run in runs)
             {
                 string id = Json.Text(run, "id");
                 int index = grid.Rows.Add(comparisonIds.Contains(id), Json.Bool(run, "favorite") ? "★" : "☆", Json.Text(run, "name", "未命名实验"), Theme.StatusText(Json.Text(run, "status")), string.Format("{0}/{1}", Json.Int(run, "current_epoch"), Json.Int(run, "total_epochs")));
                 grid.Rows[index].Tag = run;
                 grid.Rows[index].Cells[3].Style.ForeColor = Theme.StatusColor(Json.Text(run, "status"));
-                if (id == selectedId) selectRow = index;
+                if (id == selectedId) selectedRow = index;
             }
-            if (selectRow >= 0) grid.Rows[selectRow].Selected = true;
+            if (selectedRow >= 0) grid.Rows[selectedRow].Selected = true;
             populatingGrid = false;
         }
 
@@ -537,8 +863,9 @@ namespace YoloMonitorPet
         {
             selectedTitle.Text = Json.Text(run, "name", "未命名实验");
             string status = Json.Text(run, "status");
-            selectedStatus.Text = "● " + Theme.StatusText(status) + (Json.Text(run, "group_name").Length > 0 ? "   ·   " + Json.Text(run, "group_name") : "");
-            selectedStatus.ForeColor = Theme.StatusColor(status);
+            selectedStatusPill.Status = status;
+            selectedStatus.Text = Json.Text(run, "group_name").Length > 0 ? "分组 · " + Json.Text(run, "group_name") : "尚未设置实验分组";
+            selectedStatus.ForeColor = Theme.Muted;
             int epoch = Json.Int(run, "current_epoch"), total = Json.Int(run, "total_epochs");
             int batch = Json.Int(run, "current_batch"), totalBatch = Json.Int(run, "total_batches");
             progress.Value = total > 0 ? Math.Min(1000, Math.Max(0, epoch * 1000 / total)) : 0;
@@ -579,8 +906,8 @@ namespace YoloMonitorPet
             List<string> keys = new List<string>();
             foreach (object item in Json.Children(selectedDetail, "events"))
             {
-                Dictionary<string, object> metrics = Json.Child(Json.Dict(item), "metrics");
-                foreach (string key in metrics.Keys) if (!keys.Contains(key) && IsNumber(metrics[key])) keys.Add(key);
+                Dictionary<string, object> values = Json.Child(Json.Dict(item), "metrics");
+                foreach (string key in values.Keys) if (!keys.Contains(key) && IsNumber(values[key])) keys.Add(key);
             }
             metricSelector.Items.Clear();
             foreach (string key in keys) metricSelector.Items.Add(key);
@@ -607,7 +934,8 @@ namespace YoloMonitorPet
                 Dictionary<string, object> evt = Json.Dict(item);
                 Dictionary<string, object> values = Json.Child(evt, "metrics");
                 object value;
-                if (values.TryGetValue(key, out value) && IsNumber(value)) series.Points.Add(new ChartPoint(Json.Int(evt, "epoch"), Convert.ToDouble(value, CultureInfo.InvariantCulture)));
+                if (values.TryGetValue(key, out value) && IsNumber(value))
+                    series.Points.Add(new ChartPoint(Json.Int(evt, "epoch"), Convert.ToDouble(value, CultureInfo.InvariantCulture)));
             }
             chart.SetSeries(new List<ChartSeries> { series });
         }
@@ -671,7 +999,9 @@ namespace YoloMonitorPet
             {
                 deleteButton.Enabled = false;
                 await state.Api.DeleteRunAsync(Json.Text(selectedRun, "id"), password);
-                selectedRun = null; selectedDetail = null; ClearDetails();
+                selectedRun = null;
+                selectedDetail = null;
+                ClearDetails();
                 await state.RefreshAsync();
             }
             catch (AdminPasswordException) { MessageBox.Show(this, "管理员密码错误，实验记录未删除。", "删除失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
@@ -700,18 +1030,41 @@ namespace YoloMonitorPet
             value = value.Trim().TrimEnd('/');
             if (!Uri.IsWellFormedUriString(value, UriKind.Absolute) || !value.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             {
-                MessageBox.Show(this, "请输入完整的 HTTPS 地址。", "地址无效", MessageBoxButtons.OK, MessageBoxIcon.Warning); return;
+                MessageBox.Show(this, "请输入完整的 HTTPS 地址。", "地址无效", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
-            settings.ServerUrl = value; settings.Save(); state.ChangeServer(value); await state.RefreshAsync();
+            settings.ServerUrl = value;
+            settings.Save();
+            state.ChangeServer(value);
+            await state.RefreshAsync();
         }
 
-        private void SetManagementEnabled(bool enabled) { groupBox.Enabled = enabled; tagsBox.Enabled = enabled; favoriteBox.Enabled = enabled; notesButton.Enabled = enabled; saveButton.Enabled = enabled; deleteButton.Enabled = enabled; }
+        private void SetManagementEnabled(bool enabled)
+        {
+            groupBox.Enabled = enabled;
+            tagsBox.Enabled = enabled;
+            favoriteBox.Enabled = enabled;
+            notesButton.Enabled = enabled;
+            saveButton.Enabled = enabled;
+            deleteButton.Enabled = enabled;
+        }
 
         private void ClearDetails()
         {
-            selectedTitle.Text = "选择一条实验查看详情"; selectedStatus.Text = "—"; epochValue.Text = batchValue.Text = timeValue.Text = "—"; progress.Value = 0;
-            metricsText.Text = "尚无指标"; hostText.Text = "尚无硬件状态"; logText.Text = ""; groupBox.Text = tagsBox.Text = ""; favoriteBox.Checked = false;
-            metricSelector.Items.Clear(); chart.SetSeries(new List<ChartSeries>()); bestText.Text = "选择实验后显示最佳 Epoch"; SetManagementEnabled(false);
+            selectedTitle.Text = "选择一条实验查看详情";
+            selectedStatus.Text = "从左侧实验库开始";
+            selectedStatusPill.Status = "";
+            epochValue.Text = batchValue.Text = timeValue.Text = "—";
+            progress.Value = 0;
+            metricsText.Text = "尚无指标";
+            hostText.Text = "尚无硬件状态";
+            logText.Text = "";
+            groupBox.Text = tagsBox.Text = "";
+            favoriteBox.Checked = false;
+            metricSelector.Items.Clear();
+            chart.SetSeries(new List<ChartSeries>());
+            bestText.Text = "选择实验后显示最佳 Epoch";
+            SetManagementEnabled(false);
         }
 
         private static bool IsNumber(object value)
@@ -731,8 +1084,10 @@ namespace YoloMonitorPet
             if (values.Count == 0) return empty;
             return string.Join(Environment.NewLine, values.Take(limit).Select(delegate(KeyValuePair<string, object> pair)
             {
-                double number; string text = pair.Value == null ? "—" : Convert.ToString(pair.Value, CultureInfo.InvariantCulture);
-                if (double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out number)) text = number.ToString("0.######", CultureInfo.InvariantCulture);
+                double number;
+                string text = pair.Value == null ? "—" : Convert.ToString(pair.Value, CultureInfo.InvariantCulture);
+                if (double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out number))
+                    text = number.ToString("0.######", CultureInfo.InvariantCulture);
                 return pair.Key + "   " + text;
             }).ToArray());
         }
@@ -746,9 +1101,7 @@ namespace YoloMonitorPet
             if (load.Count > 0) lines.Add("CPU   " + Json.Number(load, "per_cpu_percent", 0).ToString("0.0") + "%（1 分钟负载 / 核）");
             Dictionary<string, object> memory = Json.Child(host, "memory");
             if (memory.Count > 0)
-            {
                 lines.Add(string.Format("内存   {0:0} / {1:0} MiB   {2:0.0}%", Json.Number(memory, "used_mb", 0), Json.Number(memory, "total_mb", 0), Json.Number(memory, "used_percent", 0)));
-            }
             object rawGpus;
             object[] gpus = host.TryGetValue("gpus", out rawGpus) ? Json.Array(rawGpus) : new object[0];
             if (gpus.Length == 0) lines.Add("GPU   未读取到 NVIDIA GPU 状态");
@@ -766,30 +1119,105 @@ namespace YoloMonitorPet
     internal sealed class PasswordDialog : Form
     {
         private readonly TextBox password;
+
         private PasswordDialog(string title, string message)
         {
-            Text = title; Icon = Theme.CreateAppIcon(); ClientSize = new Size(430, 170); FormBorderStyle = FormBorderStyle.FixedDialog; StartPosition = FormStartPosition.CenterParent; MaximizeBox = false; MinimizeBox = false; BackColor = Theme.Back; ForeColor = Theme.Text;
-            Label label = Theme.Label(message, 9, FontStyle.Regular, Theme.Text); label.Location = new Point(20, 18); label.MaximumSize = new Size(390, 45);
-            password = Theme.TextBox(""); password.UseSystemPasswordChar = true; password.Location = new Point(20, 73); password.Width = 390;
-            Button ok = Theme.Button("确认", true); ok.Location = new Point(236, 116); ok.DialogResult = DialogResult.OK;
-            Button cancel = Theme.Button("取消", false); cancel.Location = new Point(330, 116); cancel.DialogResult = DialogResult.Cancel;
-            Controls.Add(label); Controls.Add(password); Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            Text = title;
+            Icon = Theme.CreateAppIcon();
+            ClientSize = new Size(450, 210);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Theme.Back;
+            ForeColor = Theme.Text;
+            Font = Theme.Font(9, FontStyle.Regular);
+            DarkPanel card = new DarkPanel { Dock = DockStyle.Fill, Margin = new Padding(16), Padding = new Padding(22) };
+            Label eyebrow = Theme.Label("ADMIN VERIFICATION", 7.1f, FontStyle.Bold, Theme.Blue);
+            eyebrow.Location = new Point(22, 23);
+            Label label = Theme.Label(message, 9, FontStyle.Regular, Theme.Text);
+            label.Location = new Point(22, 49);
+            label.MaximumSize = new Size(390, 42);
+            password = Theme.TextBox("");
+            password.UseSystemPasswordChar = true;
+            password.Location = new Point(22, 98);
+            password.Width = 390;
+            Button ok = Theme.Button("确认", true);
+            ok.AutoSize = false;
+            ok.Size = new Size(92, 40);
+            ok.Location = new Point(222, 151);
+            ok.DialogResult = DialogResult.OK;
+            Button cancel = Theme.Button("取消", false);
+            cancel.AutoSize = false;
+            cancel.Size = new Size(92, 40);
+            cancel.Location = new Point(320, 151);
+            cancel.DialogResult = DialogResult.Cancel;
+            card.Controls.Add(eyebrow);
+            card.Controls.Add(label);
+            card.Controls.Add(password);
+            card.Controls.Add(ok);
+            card.Controls.Add(cancel);
+            Controls.Add(card);
+            AcceptButton = ok;
+            CancelButton = cancel;
         }
-        public static string Ask(IWin32Window owner, string title, string message) { using (PasswordDialog form = new PasswordDialog(title, message)) return form.ShowDialog(owner) == DialogResult.OK ? form.password.Text : null; }
+
+        public static string Ask(IWin32Window owner, string title, string message)
+        {
+            using (PasswordDialog form = new PasswordDialog(title, message))
+                return form.ShowDialog(owner) == DialogResult.OK ? form.password.Text : null;
+        }
     }
 
     internal sealed class TextPromptDialog : Form
     {
         private readonly TextBox valueBox;
+
         private TextPromptDialog(string title, string message, string value)
         {
-            Text = title; Icon = Theme.CreateAppIcon(); ClientSize = new Size(540, 170); FormBorderStyle = FormBorderStyle.FixedDialog; StartPosition = FormStartPosition.CenterParent; MaximizeBox = false; MinimizeBox = false; BackColor = Theme.Back; ForeColor = Theme.Text;
-            Label label = Theme.Label(message, 9, FontStyle.Regular, Theme.Text); label.Location = new Point(20, 20);
-            valueBox = Theme.TextBox(""); valueBox.Location = new Point(20, 60); valueBox.Width = 500; valueBox.Text = value;
-            Button ok = Theme.Button("保存并连接", true); ok.Location = new Point(336, 112); ok.DialogResult = DialogResult.OK;
-            Button cancel = Theme.Button("取消", false); cancel.Location = new Point(440, 112); cancel.DialogResult = DialogResult.Cancel;
-            Controls.Add(label); Controls.Add(valueBox); Controls.Add(ok); Controls.Add(cancel); AcceptButton = ok; CancelButton = cancel;
+            Text = title;
+            Icon = Theme.CreateAppIcon();
+            ClientSize = new Size(560, 220);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Theme.Back;
+            ForeColor = Theme.Text;
+            Font = Theme.Font(9, FontStyle.Regular);
+            DarkPanel card = new DarkPanel { Dock = DockStyle.Fill, Padding = new Padding(22) };
+            Label eyebrow = Theme.Label("CONNECTION SETTINGS", 7.1f, FontStyle.Bold, Theme.Blue);
+            eyebrow.Location = new Point(22, 24);
+            Label label = Theme.Label(message, 9, FontStyle.Regular, Theme.Text);
+            label.Location = new Point(22, 51);
+            valueBox = Theme.TextBox("");
+            valueBox.Location = new Point(22, 87);
+            valueBox.Width = 500;
+            valueBox.Text = value;
+            Button ok = Theme.Button("保存并连接", true);
+            ok.AutoSize = false;
+            ok.Size = new Size(128, 40);
+            ok.Location = new Point(296, 151);
+            ok.DialogResult = DialogResult.OK;
+            Button cancel = Theme.Button("取消", false);
+            cancel.AutoSize = false;
+            cancel.Size = new Size(92, 40);
+            cancel.Location = new Point(430, 151);
+            cancel.DialogResult = DialogResult.Cancel;
+            card.Controls.Add(eyebrow);
+            card.Controls.Add(label);
+            card.Controls.Add(valueBox);
+            card.Controls.Add(ok);
+            card.Controls.Add(cancel);
+            Controls.Add(card);
+            AcceptButton = ok;
+            CancelButton = cancel;
         }
-        public static string Ask(IWin32Window owner, string title, string message, string value) { using (TextPromptDialog form = new TextPromptDialog(title, message, value)) return form.ShowDialog(owner) == DialogResult.OK ? form.valueBox.Text : null; }
+
+        public static string Ask(IWin32Window owner, string title, string message, string value)
+        {
+            using (TextPromptDialog form = new TextPromptDialog(title, message, value))
+                return form.ShowDialog(owner) == DialogResult.OK ? form.valueBox.Text : null;
+        }
     }
 }

@@ -162,7 +162,10 @@ namespace YoloMonitorPet
         private readonly TrendChart chart;
         private readonly Label status;
         private readonly List<Dictionary<string, object>> details = new List<Dictionary<string, object>>();
-        private static readonly Color[] Colors = { Theme.Cyan, Theme.Amber, Theme.Green, Theme.Red, Color.FromArgb(185, 140, 255) };
+        private static Color[] SeriesColors
+        {
+            get { return new Color[] { Theme.Cyan, Theme.Amber, Theme.Green, Theme.Red, Theme.Purple }; }
+        }
 
         public ComparisonForm(MonitorApi api, List<string> ids)
         {
@@ -204,7 +207,8 @@ namespace YoloMonitorPet
             for (int i = 0; i < details.Count; i++)
             {
                 Dictionary<string, object> detail = details[i];
-                ChartSeries item = new ChartSeries { Name = Json.Text(Json.Child(detail, "run"), "name", ids[i]), Color = Colors[i % Colors.Length], Points = new List<ChartPoint>() };
+                Color[] colors = SeriesColors;
+                ChartSeries item = new ChartSeries { Name = Json.Text(Json.Child(detail, "run"), "name", ids[i]), Color = colors[i % colors.Length], Points = new List<ChartPoint>() };
                 foreach (object raw in Json.Children(detail, "events"))
                 {
                     Dictionary<string, object> evt = Json.Dict(raw), values = Json.Child(evt, "metrics"); object value;

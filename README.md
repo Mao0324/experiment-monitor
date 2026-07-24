@@ -14,6 +14,7 @@
 - 自动记录 Git commit/dirty 状态、Python/PyTorch/CUDA/Ultralytics 版本及配置文件指纹；
 - 无需登录即可只读查看实验列表、详情、对比和 SSE 实时数据；
 - 提供不含 WebView 的 Windows 原生“Epoch 精灵”EXE：悬停查看进度，点击打开本地实验控制台；
+- Windows 客户端支持 Material Design、Claymorphism、Elegant 三套可持久化切换的原生视觉风格；
 - 实验分组、标签、收藏，以及名称/状态/分组/标签组合筛选；修改分组、标签和收藏时单独校验管理员密码；
 - systemd timer 每日创建压缩 SQLite 备份，默认保留 14 天且不自动删除实验；
 - SQLite 保存历史实验与最终结果；

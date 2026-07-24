@@ -47,14 +47,25 @@ namespace YoloMonitorPet
             Controls.Add(layout);
             Resize += delegate
             {
-                using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width, Height), 16)) Region = new Region(path);
+                using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width, Height), Theme.CardRadius)) Region = new Region(path);
             };
             Paint += delegate(object sender, PaintEventArgs e)
             {
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), 16))
+                using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width - 1, Height - 1), Theme.CardRadius))
                 using (Pen pen = new Pen(Theme.Line)) e.Graphics.DrawPath(pen, path);
             };
+        }
+
+        public void ApplyVisualStyle()
+        {
+            BackColor = Theme.Panel;
+            nameLabel.ForeColor = Theme.Text;
+            epochLabel.ForeColor = Theme.Text;
+            detailLabel.ForeColor = Theme.Muted;
+            using (GraphicsPath path = Theme.RoundRect(new Rectangle(0, 0, Width, Height), Theme.CardRadius))
+                Region = new Region(path);
+            Invalidate(true);
         }
 
         public void UpdateRun(Dictionary<string, object> run, string error)
@@ -165,6 +176,7 @@ namespace YoloMonitorPet
             menu.Items.Add("打开实验面板", null, delegate { OpenDashboard(); });
             menu.Items.Add("立即刷新", null, async delegate { await state.RefreshAsync(); });
             menu.Items.Add("检查软件更新", null, async delegate { await UpdateWorkflow.CheckAndPromptAsync(this, settings.ServerUrl, false, null); });
+            menu.Items.Add(Theme.CreateStyleMenu(ChangeVisualStyle));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出 Epoch 精灵", null, delegate { Close(); });
             tray = new NotifyIcon();
@@ -249,11 +261,33 @@ namespace YoloMonitorPet
             if (dashboard == null || dashboard.IsDisposed)
             {
                 dashboard = new DashboardForm(state, settings);
-                dashboard.FormClosed += delegate { dashboard = null; };
+                DashboardForm created = dashboard;
+                dashboard.FormClosed += delegate { if (ReferenceEquals(dashboard, created)) dashboard = null; };
+                dashboard.VisualStyleChanged += delegate { RecreateDashboard(true); };
             }
             dashboard.Show();
             dashboard.WindowState = FormWindowState.Normal;
             dashboard.Activate();
+        }
+
+        private void ChangeVisualStyle(string key)
+        {
+            settings.VisualStyle = key;
+            settings.Save();
+            Theme.Use(key);
+            RecreateDashboard(dashboard != null && !dashboard.IsDisposed && dashboard.Visible);
+        }
+
+        private void RecreateDashboard(bool reopen)
+        {
+            DashboardForm old = dashboard;
+            dashboard = null;
+            if (old != null && !old.IsDisposed) old.Close();
+            hover.ApplyVisualStyle();
+            Icon = Theme.CreateAppIcon();
+            tray.Icon = Icon;
+            Invalidate(true);
+            if (reopen) OpenDashboard();
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -265,20 +299,20 @@ namespace YoloMonitorPet
             Color accent = Theme.StatusColor(status);
             int bob = status == "running" ? (int)(Math.Sin(frame / 3.0) * 2) : 0;
             Rectangle body = new Rectangle(28, 19 + bob, 102, 102);
-            using (SolidBrush shadow = new SolidBrush(Color.FromArgb(72, 0, 0, 0))) e.Graphics.FillEllipse(shadow, 31, 112, 96, 17);
-            using (Pen ear = new Pen(Color.FromArgb(48, 65, 101), 7))
+            using (SolidBrush shadow = new SolidBrush(Theme.Shadow)) e.Graphics.FillEllipse(shadow, 31, 112, 96, 17);
+            using (Pen ear = new Pen(Theme.Line, 7))
             {
                 ear.StartCap = LineCap.Round;
                 ear.EndCap = LineCap.Round;
                 e.Graphics.DrawLine(ear, 51, 30 + bob, 40, 10 + bob);
                 e.Graphics.DrawLine(ear, 107, 30 + bob, 118, 10 + bob);
             }
-            using (LinearGradientBrush bodyBrush = new LinearGradientBrush(body, Color.FromArgb(38, 55, 92), Color.FromArgb(16, 25, 48), 90))
+            using (LinearGradientBrush bodyBrush = new LinearGradientBrush(body, Theme.Raised, Theme.Panel2, 90))
                 e.Graphics.FillEllipse(bodyBrush, body);
-            using (Pen outline = new Pen(Color.FromArgb(61, 82, 126), 2)) e.Graphics.DrawEllipse(outline, body);
+            using (Pen outline = new Pen(Theme.Line, 2)) e.Graphics.DrawEllipse(outline, body);
 
             int eyeHeight = frame > 0 && (frame % 55 == 0 || frame % 55 == 1) ? 2 : 9;
-            using (SolidBrush eye = new SolidBrush(Color.FromArgb(235, 248, 255)))
+            using (SolidBrush eye = new SolidBrush(Theme.Text))
             {
                 e.Graphics.FillEllipse(eye, 55, 58 + bob + (9 - eyeHeight) / 2, 9, eyeHeight);
                 e.Graphics.FillEllipse(eye, 94, 58 + bob + (9 - eyeHeight) / 2, 9, eyeHeight);
@@ -299,7 +333,7 @@ namespace YoloMonitorPet
 
             Rectangle captionBounds = new Rectangle(14, 137, 130, 28);
             using (GraphicsPath captionPath = Theme.RoundRect(captionBounds, 14))
-            using (SolidBrush captionBack = new SolidBrush(Color.FromArgb(235, 15, 23, 42)))
+            using (SolidBrush captionBack = new SolidBrush(Color.FromArgb(245, Theme.Panel)))
             using (Pen captionBorder = new Pen(Color.FromArgb(150, accent)))
             {
                 e.Graphics.FillPath(captionBack, captionPath);

@@ -22,7 +22,7 @@ namespace YoloMonitorPet
             }
             if (args.Length > 1 && args[0] == "--render-preview")
             {
-                Environment.ExitCode = PreviewRenderer.Run(args[1]);
+                Environment.ExitCode = PreviewRenderer.Run(args[1], args.Length > 2 ? args[2] : "material");
                 return;
             }
             if (args.Length > 1 && args[0] == "--connection-test")
@@ -40,6 +40,7 @@ namespace YoloMonitorPet
                     return;
                 }
                 AppSettings settings = AppSettings.Load();
+                Theme.Use(settings.VisualStyle);
                 MonitorState state = new MonitorState(new MonitorApi(settings.ServerUrl));
                 Application.Run(new PetForm(state, settings));
             }
@@ -64,16 +65,18 @@ namespace YoloMonitorPet
 
     internal static class PreviewRenderer
     {
-        public static int Run(string directory)
+        public static int Run(string directory, string visualStyle)
         {
             try
             {
                 Directory.CreateDirectory(directory);
                 AppSettings settings = AppSettings.Default();
+                settings.VisualStyle = visualStyle;
+                Theme.Use(visualStyle);
                 using (DashboardForm dashboard = new DashboardForm(null, settings))
-                using (System.Drawing.Bitmap image = new System.Drawing.Bitmap(1280, 780))
+                using (System.Drawing.Bitmap image = new System.Drawing.Bitmap(1380, 840))
                 {
-                    dashboard.ClientSize = new System.Drawing.Size(1280, 780);
+                    dashboard.ClientSize = new System.Drawing.Size(1380, 840);
                     dashboard.StartPosition = FormStartPosition.Manual;
                     dashboard.Location = new System.Drawing.Point(-20000, -20000);
                     dashboard.ShowInTaskbar = false;
@@ -82,6 +85,20 @@ namespace YoloMonitorPet
                     dashboard.DrawToBitmap(image, new System.Drawing.Rectangle(0, 0, image.Width, image.Height));
                     image.Save(Path.Combine(directory, "dashboard-preview.png"), System.Drawing.Imaging.ImageFormat.Png);
                     dashboard.Hide();
+                }
+                using (MonitorApi api = new MonitorApi(settings.ServerUrl))
+                using (QueueForm queue = new QueueForm(api))
+                using (System.Drawing.Bitmap image = new System.Drawing.Bitmap(1240, 760))
+                {
+                    queue.ClientSize = new System.Drawing.Size(1240, 760);
+                    queue.StartPosition = FormStartPosition.Manual;
+                    queue.Location = new System.Drawing.Point(-20000, -20000);
+                    queue.ShowInTaskbar = false;
+                    queue.Show();
+                    Application.DoEvents();
+                    queue.DrawToBitmap(image, new System.Drawing.Rectangle(0, 0, image.Width, image.Height));
+                    image.Save(Path.Combine(directory, "queue-preview.png"), System.Drawing.Imaging.ImageFormat.Png);
+                    queue.Hide();
                 }
                 using (MonitorState state = new MonitorState(new MonitorApi(settings.ServerUrl)))
                 using (PetForm pet = new PetForm(state, settings))
@@ -94,7 +111,16 @@ namespace YoloMonitorPet
                 }
                 return 0;
             }
-            catch { return 1; }
+            catch (Exception ex)
+            {
+                try
+                {
+                    Directory.CreateDirectory(directory);
+                    File.WriteAllText(Path.Combine(directory, "preview-error.txt"), ex.ToString());
+                }
+                catch { }
+                return 1;
+            }
         }
     }
 
@@ -116,6 +142,11 @@ namespace YoloMonitorPet
                     return 4;
                 UpdateInfo update = UpdateManager.ParseManifest("{\"version\":\"2.0.0\",\"download_url\":\"https://monitor.maocong.me/downloads/YoloMonitorPet.exe\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"size\":123}", new Uri("https://monitor.maocong.me/"));
                 if (update.Size != 123 || update.Version != "2.0.0") return 5;
+                Theme.Use("clay");
+                if (Theme.ModeKey != "clay" || Theme.CardRadius < 18) return 6;
+                Theme.Use("elegant");
+                if (Theme.ModeKey != "elegant" || Theme.Blue == System.Drawing.Color.Empty) return 7;
+                Theme.Use("material");
                 using (TrendChart chart = new TrendChart())
                 using (DashboardForm dashboard = new DashboardForm(null, AppSettings.Default()))
                 using (HoverCardForm hover = new HoverCardForm())
