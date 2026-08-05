@@ -559,6 +559,10 @@ class SmokeTest(unittest.TestCase):
         self.assertIn('id="queueMode"', page_text)
         self.assertIn('id="sweepFields" class="sweep-box form-wide" hidden', page_text)
         self.assertNotIn('id="sweepEnabled"', page_text)
+        self.assertIn('<details class="panel agent-disclosure">', page_text)
+        self.assertIn('<summary class="agent-summary">', page_text)
+        self.assertNotIn('<details class="panel agent-disclosure" open', page_text)
+        self.assertRegex(page_text, r'在线主机 <strong>\d+</strong> · Worker Slot <strong>\d+</strong>')
 
     def test_live_log_host_status_and_multi_run_comparison(self):
         for run_id, name, value in (
