@@ -564,6 +564,67 @@ class SmokeTest(unittest.TestCase):
         self.assertNotIn('<details class="panel agent-disclosure" open', page_text)
         self.assertRegex(page_text, r'在线主机 <strong>\d+</strong> · Worker Slot <strong>\d+</strong>')
 
+    def test_only_cancelled_queue_jobs_can_be_deleted(self):
+        create = Request(
+            self.base + "/api/v1/web/queue",
+            data=json.dumps({
+                "name": "delete-cancelled-queue-smoke",
+                "command": "python train.py",
+                "working_directory": "/tmp/project",
+                "password": "test-password",
+            }).encode(),
+            headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"},
+            method="POST",
+        )
+        with urlopen(create, timeout=2) as response:
+            job = json.loads(response.read())["job"]
+        self.post_json(
+            "/api/v1/runs/start",
+            {"run_id": job["run_id"], "name": job["name"], "total_epochs": 1},
+        )
+
+        def delete_request(password):
+            return Request(
+                self.base + f"/api/v1/web/queue/{job['id']}/delete",
+                data=json.dumps({"password": password}).encode(),
+                headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"},
+                method="POST",
+            )
+
+        with self.assertRaises(HTTPError) as active_delete:
+            urlopen(delete_request("test-password"), timeout=2)
+        self.assertEqual(active_delete.exception.code, 409)
+
+        cancel = Request(
+            self.base + f"/api/v1/web/queue/{job['id']}/action",
+            data=json.dumps({"password": "test-password", "action": "cancel"}).encode(),
+            headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"},
+            method="POST",
+        )
+        with urlopen(cancel, timeout=2):
+            pass
+        with urlopen(self.base + "/queue", timeout=2) as response:
+            queue_page = response.read().decode("utf-8")
+        self.assertIn(f'data-id="{job["id"]}" data-action="delete"', queue_page)
+
+        with self.assertRaises(HTTPError) as wrong_password:
+            urlopen(delete_request("wrong-password"), timeout=2)
+        self.assertEqual(wrong_password.exception.code, 403)
+        with urlopen(delete_request("test-password"), timeout=2) as response:
+            deleted = json.loads(response.read())
+        self.assertTrue(deleted["deleted"])
+
+        with urlopen(self.base + "/api/v1/public/queue", timeout=2) as response:
+            queue_snapshot = json.loads(response.read())
+        self.assertNotIn(job["id"], {item["id"] for item in queue_snapshot["jobs"]})
+        with urlopen(self.base + f"/api/v1/public/runs/{job['run_id']}", timeout=2) as response:
+            self.assertEqual(json.loads(response.read())["run"]["id"], job["run_id"])
+        conn = sqlite3.connect(Path(self.temp.name) / "test.db")
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM job_events WHERE job_id=?", (job["id"],)).fetchone()[0], 0)
+        finally:
+            conn.close()
+
     def test_live_log_host_status_and_multi_run_comparison(self):
         for run_id, name, value in (
             ("compare-a", "comparison alpha", 0.41),
