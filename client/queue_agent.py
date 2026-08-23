@@ -41,6 +41,20 @@ class Agent:
         self.hostname = socket.gethostname()
         self.poll_seconds = max(2, int(config.get("poll_seconds", 10)))
         self.allowed_roots = [Path(value).expanduser().resolve() for value in config.get("allowed_roots", [])]
+        raw_scan_patterns = config.get(
+            "script_scan_patterns",
+            ["train_dronevehicle*.py", "train_flir*.py"],
+        )
+        if isinstance(raw_scan_patterns, str):
+            raw_scan_patterns = [raw_scan_patterns]
+        self.script_scan_patterns = []
+        if isinstance(raw_scan_patterns, (list, tuple)):
+            for value in raw_scan_patterns:
+                pattern = str(value).strip()
+                if not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                    continue
+                if pattern not in self.script_scan_patterns:
+                    self.script_scan_patterns.append(pattern)
         self.training_python = str(config.get("training_python") or sys.executable)
         self.allowed_executables = set(config.get("allowed_executables", ["python", "python3"]))
         self.allowed_executables.add(Path(self.training_python).name)
@@ -361,14 +375,21 @@ class Agent:
         items = []
         limit = max(1, min(1000, int(self.config.get("script_scan_limit", 300))))
         for root in self.allowed_roots:
-            try:
-                scripts = sorted(root.glob("train_dronevehicle*.py"))
-            except OSError:
-                continue
+            scripts = set()
+            for pattern in self.script_scan_patterns:
+                try:
+                    scripts.update(path.resolve() for path in root.glob(pattern) if path.is_file())
+                except (OSError, ValueError):
+                    continue
+            scripts = sorted(scripts)
             for script in scripts:
                 if len(items) >= limit:
                     return items
-                info = self.inspect_script(script.resolve(), root)
+                try:
+                    script.relative_to(root)
+                except ValueError:
+                    continue
+                info = self.inspect_script(script, root)
                 if not info.get("error"):
                     items.append(info)
         return items

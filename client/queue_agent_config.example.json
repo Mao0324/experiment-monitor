@@ -9,6 +9,10 @@
   "allowed_executables": ["python", "python3"],
   "training_python": "/home/biiteam/anaconda3/envs/spikeyolo/bin/python",
   "default_batch": 64,
+  "script_scan_patterns": [
+    "train_dronevehicle*.py",
+    "train_flir*.py"
+  ],
   "script_scan_seconds": 300,
   "script_scan_limit": 300,
   "preflight_import_timeout_seconds": 90,

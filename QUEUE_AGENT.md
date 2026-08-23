@@ -26,7 +26,8 @@ Agent 服务固定从 `/opt/yolo-monitor-agent` 启动；每个实验仍会切�
 
 ## 脚本目录、预检与批量消融
 
-- Agent 只扫描每个 `allowed_roots` 顶层的 `train_dronevehicle*.py`，不会执行脚本；它使用 Python AST 提取实验名、默认 batch、默认 GPU、checkpoint 和 data/model 配置路径。
+- Agent 按配置文件的 `script_scan_patterns` 扫描每个 `allowed_roots`，不会执行脚本；默认匹配 `train_dronevehicle*.py` 和 `train_flir*.py`。它使用 Python AST 提取实验名、默认 batch、默认 GPU、checkpoint 和 data/model 配置路径。
+- `script_scan_patterns` 接受字符串数组，例如 `["train_dronevehicle*.py", "train_flir*.py"]`。模式相对 `allowed_roots` 解析；如需扫描子目录，可显式使用 `**/train_flir*.py`。重叠模式会自动去重，绝对路径和包含 `..` 的越界模式会被忽略。
 - 网页选择脚本后会自动填写任务名、Python、工作目录和启动命令。脚本内置预训练权重只作只读提示；“断点 checkpoint”仅在续训时填写 `last.pt`。
 - 新任务必须先通过无 GPU 预检：路径白名单、Python/脚本/checkpoint/data/model 文件、磁盘空间，以及在 `CUDA_VISIBLE_DEVICES=""` 下导入 PyTorch 和 Ultralytics。
 - 批量消融按“脚本 × batch”生成队列任务，单次最多 50 条。

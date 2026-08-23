@@ -342,6 +342,33 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(catalog[0]["lineage_confidence"], "exact")
             self.assertEqual(catalog[0]["change_summary"], "仅将 attention 用 FP32 计算，\n然后转回原 dtype。")
 
+    def test_agent_script_catalog_uses_configured_scan_patterns(self):
+        spec = importlib.util.spec_from_file_location("queue_agent_patterns", QUEUE_AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in (
+                "train_dronevehicle_baseline.py",
+                "train_flir_darkact_semantic_disagreement_laf_p34_scalen_hbb.py",
+                "train_helper.py",
+            ):
+                (root / name).write_text("batch = 8\n", encoding="utf-8")
+            agent = module.Agent({
+                "server_url": "https://example.invalid", "api_token": "x", "agent_id": "pattern-test",
+                "allowed_roots": [str(root)], "training_python": sys.executable,
+                "script_scan_patterns": ["train_dronevehicle*.py", "train_flir*.py", "train_flir*.py", "../*.py"],
+                "log_directory": str(root / "state"),
+            })
+            catalog = agent.scan_catalog()
+            self.assertEqual(
+                [item["name"] for item in catalog],
+                [
+                    "train_dronevehicle_baseline.py",
+                    "train_flir_darkact_semantic_disagreement_laf_p34_scalen_hbb.py",
+                ],
+            )
+
     def test_safe_pause_callback_stops_at_epoch_boundary(self):
         sys.path.insert(0, str(ROOT / "client"))
         from yolo_monitor import YoloExperimentMonitor, install_queue_control_callback
@@ -564,7 +591,7 @@ class SmokeTest(unittest.TestCase):
         self.assertNotIn('<details class="panel agent-disclosure" open', page_text)
         self.assertRegex(page_text, r'在线主机 <strong>\d+</strong> · Worker Slot <strong>\d+</strong>')
 
-    def test_only_cancelled_queue_jobs_can_be_deleted(self):
+    def test_cancelled_queue_jobs_can_be_deleted(self):
         create = Request(
             self.base + "/api/v1/web/queue",
             data=json.dumps({
@@ -624,6 +651,64 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM job_events WHERE job_id=?", (job["id"],)).fetchone()[0], 0)
         finally:
             conn.close()
+
+    def test_failed_queue_job_delete_respects_three_epoch_boundary(self):
+        def create_failed_job(name, current_epoch):
+            request = Request(
+                self.base + "/api/v1/web/queue",
+                data=json.dumps({
+                    "name": name,
+                    "command": "python train.py",
+                    "working_directory": "/tmp/project",
+                    "password": "test-password",
+                }).encode(),
+                headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"},
+                method="POST",
+            )
+            with urlopen(request, timeout=2) as response:
+                job = json.loads(response.read())["job"]
+            self.post_json(
+                "/api/v1/runs/start",
+                {"run_id": job["run_id"], "name": name, "total_epochs": 100},
+            )
+            conn = sqlite3.connect(Path(self.temp.name) / "test.db")
+            try:
+                conn.execute("UPDATE runs SET current_epoch=? WHERE id=?", (current_epoch, job["run_id"]))
+                conn.execute("UPDATE queue_jobs SET status='failed' WHERE id=?", (job["id"],))
+                conn.commit()
+            finally:
+                conn.close()
+            return job
+
+        failed_at_two = create_failed_job("failed-delete-epoch-2", 2)
+        failed_at_three = create_failed_job("failed-keep-epoch-3", 3)
+
+        with urlopen(self.base + "/queue", timeout=2) as response:
+            queue_page = response.read().decode("utf-8")
+        self.assertIn(f'data-id="{failed_at_two["id"]}" data-action="delete"', queue_page)
+        self.assertNotIn(f'data-id="{failed_at_three["id"]}" data-action="delete"', queue_page)
+        self.assertIn("已训练 ≥3 Epoch，不能删除队列记录", queue_page)
+
+        def delete_request(job):
+            return Request(
+                self.base + f"/api/v1/web/queue/{job['id']}/delete",
+                data=json.dumps({"password": "test-password"}).encode(),
+                headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"},
+                method="POST",
+            )
+
+        with urlopen(delete_request(failed_at_two), timeout=2) as response:
+            self.assertTrue(json.loads(response.read())["deleted"])
+        with self.assertRaises(HTTPError) as protected:
+            urlopen(delete_request(failed_at_three), timeout=2)
+        self.assertEqual(protected.exception.code, 409)
+
+        with urlopen(self.base + "/api/v1/public/queue", timeout=2) as response:
+            remaining_ids = {item["id"] for item in json.loads(response.read())["jobs"]}
+        self.assertNotIn(failed_at_two["id"], remaining_ids)
+        self.assertIn(failed_at_three["id"], remaining_ids)
+        with urlopen(self.base + f"/api/v1/public/runs/{failed_at_two['run_id']}", timeout=2) as response:
+            self.assertEqual(json.loads(response.read())["run"]["current_epoch"], 2)
 
     def test_live_log_host_status_and_multi_run_comparison(self):
         for run_id, name, value in (
