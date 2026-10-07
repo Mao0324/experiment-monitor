@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -30,6 +32,15 @@ MONITOR_ANOMALY_PREFIX = "[YOLO monitor anomaly]"
 QUEUE_CONTROL_PREFIX = "[YOLO queue control]"
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OUTPUT_DIR_RE = re.compile(r"Logging results to\s+(.+?)\s*$", re.I | re.M)
+CUDA_PROBE_CODE = """import ctypes,sys
+try:
+ lib=ctypes.CDLL('libcuda.so.1')
+ count=ctypes.c_int()
+ ok=lib.cuInit(0)==0 and lib.cuDeviceGetCount(ctypes.byref(count))==0 and count.value==1
+ sys.exit(0 if ok else 1)
+except Exception:
+ sys.exit(1)
+"""
 
 
 class Agent:
@@ -43,7 +54,7 @@ class Agent:
         self.allowed_roots = [Path(value).expanduser().resolve() for value in config.get("allowed_roots", [])]
         raw_scan_patterns = config.get(
             "script_scan_patterns",
-            ["train_dronevehicle*.py", "train_flir*.py"],
+            ["train/*/train_dronevehicle*.py", "train/*/train_flir*.py"],
         )
         if isinstance(raw_scan_patterns, str):
             raw_scan_patterns = [raw_scan_patterns]
@@ -61,6 +72,7 @@ class Agent:
         self.idle_utilization = float(config.get("gpu_idle_utilization_percent", 5))
         self.idle_memory_used = float(config.get("gpu_idle_memory_used_mb", 3000))
         self.idle_since: dict[int, float] = {}
+        self.cuda_probe_cache: dict[int, tuple[float, bool]] = {}
         self.opener = build_opener(ProxyHandler({}))
         self.stop_requested = False
         self.current_job: dict | None = None
@@ -75,6 +87,7 @@ class Agent:
         self.state_path = Path(config.get("state_file") or (self.log_dir / "agent-state.json")).expanduser()
         self.catalog: list[dict] = []
         self.catalog_at = 0.0
+        self.reconcile_at: dict[str, float] = {}
         self._load_state()
 
     def request(self, path: str, payload: dict) -> dict:
@@ -164,13 +177,48 @@ class Agent:
             if len(parts) != 7:
                 continue
             try:
-                index, utilization, used, free, total, temperature = int(parts[0]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+                index = int(parts[0])
             except ValueError:
                 continue
-            idle = utilization <= self.idle_utilization and used <= self.idle_memory_used
+            telemetry_usable = True
+            try:
+                utilization = float(parts[2])
+            except ValueError:
+                telemetry_usable = False
+                utilization = 100.0
+            try:
+                used, free, total = map(float, (parts[3], parts[4], parts[5]))
+            except ValueError:
+                telemetry_usable = False
+                used, free, total = 0.0, 0.0, 0.0
+            try:
+                temperature = float(parts[6])
+            except ValueError:
+                temperature = -1.0
+            idle = telemetry_usable and utilization <= self.idle_utilization and used <= self.idle_memory_used
             self.idle_since.setdefault(index, now) if idle else self.idle_since.pop(index, None)
-            gpus.append({"index": index, "name": parts[1], "utilization_percent": utilization, "memory_used_mb": used, "memory_free_mb": free, "memory_total_mb": total, "temperature_c": temperature, "idle_for_seconds": round(now - self.idle_since[index], 1) if index in self.idle_since else 0})
+            cuda_usable = self.cuda_usable(index) if idle else None
+            gpus.append({"index": index, "name": parts[1], "utilization_percent": utilization, "memory_used_mb": used, "memory_free_mb": free, "memory_total_mb": total, "temperature_c": temperature, "idle_for_seconds": round(now - self.idle_since[index], 1) if index in self.idle_since and cuda_usable is not False else 0, "cuda_usable": cuda_usable, "telemetry_usable": telemetry_usable})
         return gpus
+
+    def cuda_usable(self, index: int) -> bool:
+        now = time.monotonic()
+        cached = self.cuda_probe_cache.get(index)
+        if cached and now - cached[0] < max(30, int(self.config.get("gpu_cuda_probe_seconds", 300))):
+            return cached[1]
+        env = os.environ.copy()
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = str(index)
+        try:
+            result = subprocess.run([sys.executable, "-c", CUDA_PROBE_CODE], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            usable = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            usable = False
+        self.cuda_probe_cache[index] = (now, usable)
+        if not usable:
+            print(f"[queue agent] GPU {index} visible in nvidia-smi but unavailable to CUDA; excluding it", flush=True)
+        return usable
 
     @staticmethod
     def _literal(node):
@@ -180,9 +228,16 @@ class Agent:
             return None
 
     def _path_expression(self, node, root: Path) -> str:
+        if isinstance(node, ast.Name) and node.id in {"ROOT", "REPO_ROOT", "_REPO_ROOT"}:
+            return str(root)
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             value = Path(node.value).expanduser()
             return str(value if value.is_absolute() else (root / value).resolve())
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left = self._path_expression(node.left, root)
+            right = self._literal(node.right)
+            if left and isinstance(right, str):
+                return str((Path(left) / right).resolve())
         if isinstance(node, ast.Call) and node.args:
             name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
             if name in {"str", "Path"}:
@@ -354,6 +409,16 @@ class Agent:
             model_yaml = self._resolve_project_path(yaml_match.group(1), root)
             model_yaml_info = self.inspect_model_yaml(model_yaml, root)
         script_id = hashlib.sha256(str(script).encode()).hexdigest()[:20]
+        configured_gpu_count = self.config.get("catalog_default_gpu_count", 2)
+        try:
+            configured_gpu_count = max(1, int(configured_gpu_count))
+        except (TypeError, ValueError):
+            configured_gpu_count = 2
+        default_gpu_count = (
+            configured_gpu_count
+            if default_device.strip().lower() in {"", "auto"}
+            else max(1, len([part for part in default_device.split(",") if part.strip()]))
+        )
         return {
             "id": script_id,
             "name": script.name,
@@ -367,7 +432,7 @@ class Agent:
             "data_files": list(dict.fromkeys(data_files)),
             "model_files": list(dict.fromkeys(model_files)),
             "default_device": default_device,
-            "default_gpu_count": max(1, len([part for part in default_device.split(",") if part.strip()])),
+            "default_gpu_count": default_gpu_count,
             **model_yaml_info,
         }
 
@@ -402,6 +467,12 @@ class Agent:
 
     def heartbeat(self, gpus: list[dict]) -> dict:
         self.refresh_catalog()
+        log_age = None
+        if self.current_job and self.current_pid:
+            try:
+                log_age = max(0, int(time.time() - self.log_path(self.current_job).stat().st_mtime))
+            except OSError:
+                pass
         response = self.request("/api/v1/agents/heartbeat", {
             "agent_id": self.agent_id, "hostname": self.hostname,
             "state": "running" if self.current_job and self.current_pid else "idle",
@@ -409,7 +480,10 @@ class Agent:
             "idle_reminder_seconds": int(self.config.get("idle_reminder_seconds", 1800)),
             "idle_reminder_gpu_count": int(self.config.get("idle_reminder_gpu_count", 1)),
             "catalog": self.catalog,
-            "capabilities": {"preflight": True, "safe_pause": True, "restart_recovery": True, "version": "2.0", "idle_utilization_percent": self.idle_utilization, "idle_memory_used_mb": self.idle_memory_used},
+            "capabilities": {"preflight": True, "safe_pause": True, "restart_recovery": True,
+                             "reconcile_v1": True, "gpu_cuda_probe": True, "version": "2.0",
+                             "idle_utilization_percent": self.idle_utilization, "idle_memory_used_mb": self.idle_memory_used,
+                             "current_log_age_seconds": log_age},
         })
         current = response.get("current_job") or {}
         if self.current_job and current.get("id") == self.current_job.get("id"):
@@ -423,10 +497,80 @@ class Agent:
             self.terminate_process()
         elif self.current_pid and current.get("pause_requested"):
             self.request_safe_pause()
+        for job in response.get("reconcile_jobs") or []:
+            try:
+                self.reconcile_job(job)
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                print(f"[queue agent] reconciliation failed for {job.get('id')}: {exc}", flush=True)
         return response
 
+    def reconcile_job(self, job: dict):
+        """Verify one exact output binding; never infer results from a similarly named run."""
+        job_id = str(job.get("id") or "")
+        output_dir = Path(str(job.get("output_dir") or "")).expanduser().resolve()
+        csv_path = Path(str(job.get("output_results_csv") or "")).expanduser().resolve()
+        if not job_id or not self.within_allowed_root(output_dir) or csv_path != output_dir / "results.csv":
+            raise ValueError("unsafe or mismatched output binding")
+        rows = []
+        if csv_path.is_file():
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                for raw in csv.DictReader(stream):
+                    if not isinstance(raw, dict):
+                        continue
+                    fields = {str(key).strip(): value for key, value in raw.items() if key is not None}
+                    try:
+                        epoch = int(float(fields.pop("epoch", "")))
+                    except (TypeError, ValueError):
+                        continue
+                    if not 1 <= epoch <= 10000 or any(value is None for value in fields.values()):
+                        continue
+                    metrics = {}
+                    for key, value in fields.items():
+                        if not key or len(key) > 120:
+                            continue
+                        try:
+                            number = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(number):
+                            metrics[key] = number
+                    if metrics:
+                        rows.append({"epoch": epoch, "metrics": metrics})
+                    if len(rows) >= 1000:
+                        break
+        log_path = self.log_dir / f"{job_id}.log"
+        text = ""
+        if log_path.is_file():
+            with log_path.open("rb") as stream:
+                stream.seek(max(0, log_path.stat().st_size - 2_000_000))
+                text = stream.read().decode("utf-8", errors="replace")
+        total_epochs = int(job.get("total_epochs") or 0)
+        marker = re.search(rf"\b{total_epochs}\s+epochs completed in\b", text, re.I) if total_epochs else None
+        tail_after = text[marker.end():] if marker else ""
+        fatal_position = max(tail_after.rfind("Traceback (most recent call last)"),
+                             tail_after.rfind("subprocess.CalledProcessError"))
+        success_position = max(tail_after.rfind("Prompt experiment report:"),
+                               tail_after.rfind("inference checkpoint:"))
+        completed_log = bool(marker and (fatal_position < 0 or success_position > fatal_position))
+        checkpoints = [output_dir / "weights" / "last.pt", output_dir / "weights" / "best.pt"]
+        evidence = {
+            "csv_max_epoch": max((row["epoch"] for row in rows), default=0),
+            "process_alive": self.process_matches(int(job.get("runtime_pid") or 0), job_id),
+            "completed_log": completed_log,
+            "checkpoint_exists": any(path.is_file() for path in checkpoints),
+            "log_age_seconds": max(0, int(time.time() - log_path.stat().st_mtime)) if log_path.is_file() else None,
+        }
+        path = f"/api/v1/agents/jobs/{job_id}/reconcile"
+        for start in range(0, max(1, len(rows)), 25):
+            chunk = rows[start:start + 25]
+            final = start + 25 >= len(rows)
+            self.request(path, {"agent_id": self.agent_id, "output_dir": str(output_dir),
+                                "epochs": chunk, "evidence": evidence if final else {}})
+        print(f"[queue agent] reconciled {job_id}: {len(rows)} CSV epochs, complete={completed_log}, alive={evidence['process_alive']}", flush=True)
+
     def claim(self, gpus: list[dict]) -> dict | None:
-        return self.request("/api/v1/agents/claim", {"agent_id": self.agent_id, "gpus": gpus}).get("job")
+        usable = [gpu for gpu in gpus if gpu.get("cuda_usable") is not False and gpu.get("telemetry_usable") is not False]
+        return self.request("/api/v1/agents/claim", {"agent_id": self.agent_id, "gpus": usable}).get("job")
 
     def update_job(self, job: dict, status: str, **extra) -> dict:
         return self.request(f"/api/v1/agents/jobs/{job['id']}/status", {"agent_id": self.agent_id, "status": status, **extra}).get("job") or {}
@@ -501,6 +645,26 @@ class Agent:
             index += 1
         return [value for value in result if value]
 
+    def resolve_script_argument(self, argument: str, cwd: Path) -> Path:
+        """Map a missing pre-migration root entry point to one unique family entry."""
+        supplied = Path(argument).expanduser()
+        script = supplied.resolve() if supplied.is_absolute() else (cwd / supplied).resolve()
+        if script.is_file():
+            return script
+        if script.parent != cwd or not re.fullmatch(
+            r"train_(?:dronevehicle|flir)[A-Za-z0-9_.-]*\.py", script.name
+        ):
+            return script
+        candidates = [
+            candidate.resolve()
+            for candidate in cwd.glob(f"train/*/{script.name}")
+            if candidate.is_file() and self.within_allowed_root(candidate.resolve())
+        ]
+        if len(candidates) == 1:
+            print(f"[queue agent] remapped moved training entry: {script} -> {candidates[0]}", flush=True)
+            return candidates[0]
+        return script
+
     def validate_job(self, job: dict):
         cwd = Path(job["working_directory"]).expanduser().resolve()
         if not cwd.is_dir() or not self.within_allowed_root(cwd):
@@ -516,11 +680,12 @@ class Agent:
         if not resolved_executable.is_file():
             raise ValueError(f"python executable does not exist: {command[0]}")
         scripts = []
-        for argument in command[1:]:
+        for index, argument in enumerate(command[1:], start=1):
             if argument.endswith(".py"):
-                script = (cwd / argument).resolve() if not Path(argument).is_absolute() else Path(argument).resolve()
+                script = self.resolve_script_argument(argument, cwd)
                 if not script.is_file() or not self.within_allowed_root(script):
                     raise ValueError(f"script is outside allowed_roots: {script}")
+                command[index] = str(script)
                 scripts.append(script)
         if not scripts:
             raise ValueError("training command must contain an allowlisted .py script")
@@ -581,8 +746,16 @@ class Agent:
 
     def runtime_environment(self, job: dict, assigned: list[str]) -> dict:
         env = os.environ.copy()
+        cwd = Path(job["working_directory"]).expanduser().resolve()
+        required_paths = [str(cwd)]
+        if (cwd / "monitor").is_dir():
+            required_paths.append(str(cwd / "monitor"))
+        existing_paths = [part for part in env.get("PYTHONPATH", "").split(os.pathsep) if part]
+        existing_paths = [part for part in existing_paths if part not in required_paths]
+        env["PYTHONPATH"] = os.pathsep.join((*required_paths, *existing_paths))
         env.update({
             "CUDA_VISIBLE_DEVICES": ",".join(assigned), "YOLO_MONITOR_URL": self.server,
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "YOLO_MONITOR_TOKEN": self.token, "YOLO_MONITOR_RUN_ID": job["run_id"],
             "YOLO_MONITOR_ADOPT_ENV_RUN_ID": "true", "YOLO_EXPERIMENT_NAME": job["name"],
             "YOLO_QUEUE_JOB_ID": job["id"], "YOLO_QUEUE_BATCH": str(job.get("batch_size") or ""),
@@ -659,7 +832,15 @@ class Agent:
         if not job:
             return
         last_heartbeat = 0.0
-        while self.current_pid and self.process_alive(self.current_pid) and not self.stop_requested:
+        while self.current_pid and not self.stop_requested:
+            # Popen.poll() both detects completion and reaps a child. Merely
+            # probing it with kill(pid, 0) can report an unreaped zombie as
+            # alive forever and wedge the worker slot on a finished job.
+            if self.current_process is not None:
+                if self.current_process.poll() is not None:
+                    break
+            elif not self.process_alive(self.current_pid):
+                break
             self.read_new_log()
             if time.monotonic() - last_heartbeat >= self.poll_seconds:
                 last_heartbeat = time.monotonic()
@@ -685,10 +866,20 @@ class Agent:
         elif self.current_process is None and exit_code is None:
             message = "Agent 重启后发现原训练进程已经消失"
             self.anomaly(job, "recovery_process_missing", message)
-            if checkpoint:
-                self.update_job(job, "paused", error=message, resume_checkpoint=checkpoint, last_checkpoint=checkpoint)
-            else:
-                self.update_job(job, "failed", error=message)
+            try:
+                if checkpoint:
+                    self.update_job(job, "paused", error=message, resume_checkpoint=checkpoint, last_checkpoint=checkpoint)
+                else:
+                    self.update_job(job, "failed", error=message)
+            except HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # A deleted server-side lease can never be updated. Releasing
+                # its stale local state prevents this slot retrying forever.
+                print(
+                    f"[queue agent] stale job {job.get('id')} no longer exists on server; releasing local slot",
+                    flush=True,
+                )
         elif exit_code == 0 and self.detected_anomaly is None:
             self.update_job(job, "completed", message="process exited successfully", last_checkpoint=checkpoint)
         else:
@@ -799,7 +990,20 @@ class Agent:
                     if self.current_pid and self.process_matches(self.current_pid, str(self.current_job.get("id"))):
                         self.monitor_current_process()
                         continue
-                    self.heartbeat(self.gpu_status())
+                    try:
+                        self.heartbeat(self.gpu_status())
+                    except HTTPError as exc:
+                        if exc.code != 404:
+                            raise
+                        # The server has discarded this dead recovered lease.
+                        # It is safe to clear only because no matching process exists.
+                        print(
+                            f"[queue agent] dead recovered job {self.current_job.get('id')} is absent on server; "
+                            "releasing local slot",
+                            flush=True,
+                        )
+                        self.clear_runtime()
+                        continue
                     self.finish_process(self.current_job, None)
                     continue
                 gpus = self.gpu_status()

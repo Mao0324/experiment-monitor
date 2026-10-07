@@ -19,6 +19,7 @@
   "poll_seconds": 10,
   "gpu_idle_utilization_percent": 5,
   "gpu_idle_memory_used_mb": 3000,
+  "gpu_cuda_probe_seconds": 300,
   "idle_reminder_seconds": 2100,
   "idle_reminder_gpu_count": 2,
   "min_disk_free_gb": 20,
