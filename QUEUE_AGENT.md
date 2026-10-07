@@ -36,7 +36,7 @@ Agent 服务固定从 `/opt/yolo-monitor-agent` 启动；每个实验仍会切�
 
 把本包的 `client/yolo_monitor.py` 更新到训练项目实际导入的监控模块。Agent 会设置 `YOLO_QUEUE_CONTROL_FILE`；点击“完成当前 Epoch 后暂停”后，每个 DDP rank 会在同一个 Epoch 边界设置 `trainer.stop`，随后使用最新 `last.pt` 恢复。
 
-Agent 将 PID、任务、日志位置和读取偏移保存在 `state_file`。systemd 使用 `KillMode=process`，因此只重启 Agent 不会杀死训练子进程；新 Agent 会校验 `/proc/<pid>/environ` 中的任务 ID 后重新接管。若进程已经消失，有 `last.pt` 时任务转为“已暂停”等待人工恢复，没有 checkpoint 时标记失败，避免永久卡在“运行中”。
+Agent 将 PID、任务、日志位置和读取偏移保存在 `state_file`。systemd 使用 `KillMode=process`，因此只重启 Agent 不会杀死训练子进程；新 Agent 会校验 `/proc/<pid>/environ` 中的任务 ID 后重新接管。若进程已经消失，会先读取服务器上的 Run 完成状态；服务器尚未确认完成且已绑定输出目录时，再核验对应的 `results.csv`、日志和 checkpoint。确认训练已完成时直接清理旧状态，不发送“进程消失”异常；未完成时，有 `last.pt` 的任务转为“已暂停”等待人工恢复，没有 checkpoint 则标记失败。服务器还会阻止旧版 Agent 将已完成 Run 错误回退为暂停，并在发送恢复异常邮件前再次核对完成状态。
 
 `worker_slots` 控制同一训练机可同时管理多少个独立任务。第一个槽位沿用 `agent_id` 和 `state_file`，其余槽位自动使用 `agent_id-slot-N` 与 `agent-state.slot-N.json`，所以每个任务的恢复状态互不覆盖。
 

@@ -990,18 +990,30 @@ class Agent:
                     if self.current_pid and self.process_matches(self.current_pid, str(self.current_job.get("id"))):
                         self.monitor_current_process()
                         continue
-                    try:
-                        self.heartbeat(self.gpu_status())
-                    except HTTPError as exc:
-                        if exc.code != 404:
-                            raise
-                        # The server has discarded this dead recovered lease.
-                        # It is safe to clear only because no matching process exists.
-                        print(
-                            f"[queue agent] dead recovered job {self.current_job.get('id')} is absent on server; "
-                            "releasing local slot",
-                            flush=True,
-                        )
+                    response = self.heartbeat(self.gpu_status())
+                    server_job = response.get("current_job") or {}
+                    if not server_job:
+                        print(f"[queue agent] recovered job {self.current_job.get('id')} is absent on server; releasing local slot", flush=True)
+                        self.clear_runtime()
+                        continue
+                    if not server_job.get("run_verified_complete") and server_job.get("output_dir") and server_job.get("output_results_csv"):
+                        # The exact bound output can prove completion even when
+                        # the final callback was lost during the Agent restart.
+                        try:
+                            self.reconcile_job(server_job)
+                        except (OSError, ValueError) as exc:
+                            print(f"[queue agent] recovery verification unavailable: {exc}", flush=True)
+                        else:
+                            server_job = (self.heartbeat(self.gpu_status()).get("current_job") or server_job)
+                    if server_job.get("run_verified_complete"):
+                        if server_job.get("status") != "completed":
+                            self.update_job(self.current_job, "completed", message="Run completion verified during Agent recovery",
+                                            last_checkpoint=self.discover_checkpoint(self.current_job))
+                        print(f"[queue agent] recovered completed Run for {self.current_job.get('name')}; no anomaly", flush=True)
+                        self.clear_runtime()
+                        continue
+                    if server_job.get("status") in {"completed", "cancelled", "paused", "failed"}:
+                        print(f"[queue agent] recovered terminal queue status {server_job['status']}; releasing local slot", flush=True)
                         self.clear_runtime()
                         continue
                     self.finish_process(self.current_job, None)

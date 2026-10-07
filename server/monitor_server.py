@@ -1650,25 +1650,96 @@ class Store:
                     return self._queue_row(leased, True)
         return None
 
+    @staticmethod
+    def _run_verified_complete(conn: sqlite3.Connection, run_id: str) -> bool:
+        row = conn.execute(
+            "SELECT status,current_epoch,total_epochs FROM runs WHERE id=?", (run_id,)
+        ).fetchone()
+        return bool(
+            row and row["status"] == "completed"
+            and int(row["total_epochs"] or 0) > 0
+            and int(row["current_epoch"] or 0) >= int(row["total_epochs"])
+        )
+
+    def run_verified_complete(self, run_id: str) -> bool:
+        if not run_id:
+            return False
+        with self.connect() as conn:
+            return self._run_verified_complete(conn, run_id)
+
+    def run_recovery_state(self, run_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT status,current_epoch,total_epochs FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+        if not row:
+            return {"run_verified_complete": False, "total_epochs": 0}
+        total = int(row["total_epochs"] or 0)
+        return {
+            "run_verified_complete": row["status"] == "completed" and total > 0
+            and int(row["current_epoch"] or 0) >= total,
+            "total_epochs": total,
+        }
+
+    def repair_completed_recovery_job(self, job_id: str) -> bool:
+        """Reconcile a missing-process report against an already finished Run."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute("SELECT * FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+            if not job or not self._run_verified_complete(conn, job["run_id"]):
+                return False
+            recovery_error = job["last_error"] == "Agent 重启后发现原训练进程已经消失"
+            if job["status"] in {"leased", "running"} or (recovery_error and job["status"] in {"paused", "failed"}):
+                now = utc_now()
+                conn.execute(
+                    """UPDATE queue_jobs SET status='completed',ended_at=COALESCE(ended_at,?),
+                    updated_at=?,last_error='',fault_suggestion='',agent_id='',runtime_pid=0,
+                    pause_requested=0 WHERE id=?""",
+                    (now, now, job_id),
+                )
+                conn.execute(
+                    "INSERT INTO job_events(job_id,created_at,kind,message,data_json) VALUES (?,?,?,?,?)",
+                    (job_id, now, "recovery_completed", "原训练进程已退出，但 Run 已完成；已校正队列状态", "{}"),
+                )
+            return True
+
     def agent_job_update(self, job_id: str, payload: dict) -> dict | None:
-        job = self.get_queue_job(job_id, True)
-        if not job:
-            return None
         agent_id = str(payload.get("agent_id") or "")[:120]
-        if not job.get("agent_id") or agent_id != job["agent_id"]:
-            raise PermissionError("job lease belongs to another agent")
         status = str(payload.get("status") or "running")
         if status not in {"running", "completed", "failed", "queued", "waiting_memory", "cancelled", "paused"}:
             raise ValueError("invalid job status")
-        error = str(payload.get("error") or "")[:4000]
-        batch_size = payload.get("batch_size", job.get("batch_size"))
-        resume_checkpoint = str(payload.get("resume_checkpoint", job.get("resume_checkpoint") or ""))[:1000]
-        last_checkpoint = str(payload.get("last_checkpoint", job.get("last_checkpoint") or ""))[:1000]
-        runtime_pid = max(0, int(payload.get("runtime_pid") or 0))
-        not_before = payload.get("not_before")
         now = utc_now()
-        ended = now if status in {"completed", "failed", "cancelled", "paused"} else None
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                return None
+            verified = self._run_verified_complete(conn, row["run_id"])
+            if row["status"] == "completed":
+                return self._queue_row(row, True)
+            if row["status"] in {"paused", "failed", "cancelled"} and not row["agent_id"]:
+                recovery_error = row["last_error"] == "Agent 重启后发现原训练进程已经消失"
+                if not (verified and recovery_error and status == "completed"):
+                    return self._queue_row(row, True)
+            recovery_missing = str(payload.get("error") or "") == "Agent 重启后发现原训练进程已经消失"
+            # Only the recovery path is normalized. A genuine post-training
+            # process failure must retain its failed status for inspection.
+            recovered = verified and recovery_missing and status in {"paused", "failed"}
+            if recovered:
+                status = "completed"
+            if not row["agent_id"] or agent_id != row["agent_id"]:
+                # Recover an older false pause whose lease was already cleared.
+                if not (verified and status == "completed" and
+                        row["status"] in {"paused", "failed"} and
+                        row["last_error"] == "Agent 重启后发现原训练进程已经消失"):
+                    raise PermissionError("job lease belongs to another agent")
+            error = "" if recovered else str(payload.get("error") or "")[:4000]
+            batch_size = payload.get("batch_size", row["batch_size"])
+            resume_checkpoint = str(payload.get("resume_checkpoint", row["resume_checkpoint"] or ""))[:1000]
+            last_checkpoint = str(payload.get("last_checkpoint", row["last_checkpoint"] or ""))[:1000]
+            runtime_pid = max(0, int(payload.get("runtime_pid") or 0))
+            not_before = payload.get("not_before")
+            ended = now if status in {"completed", "failed", "cancelled", "paused"} else None
             conn.execute(
                 """UPDATE queue_jobs SET status=?,updated_at=?,ended_at=?,last_error=?,
                 batch_size=?,resume_checkpoint=?,last_checkpoint=?,runtime_pid=?,not_before=?,
@@ -1682,7 +1753,10 @@ class Store:
             )
             conn.execute(
                 "INSERT INTO job_events(job_id,created_at,kind,message,data_json) VALUES (?,?,?,?,?)",
-                (job_id, now, status, error or str(payload.get("message") or "")[:2000], json.dumps(payload.get("data") or {}, ensure_ascii=False)),
+                (job_id, now, status,
+                 "Run 已完成，恢复状态已校正" if recovered else
+                 error or str(payload.get("message") or "")[:2000],
+                 json.dumps(payload.get("data") or {}, ensure_ascii=False)),
             )
         return self.get_queue_job(job_id, True)
 
@@ -1744,6 +1818,7 @@ class Store:
                 AND (q.reconcile_requested_at IS NULL OR q.reconcile_requested_at<?)
                 AND (r.status IN ('stalled','failed') OR
                      (q.status='failed' AND r.status='completed') OR
+                     (q.status='paused' AND q.last_error='Agent 重启后发现原训练进程已经消失') OR
                      (SELECT COUNT(DISTINCT e.epoch) FROM metric_events e
                       WHERE e.run_id=r.id AND e.phase='epoch')<r.current_epoch)
                 ORDER BY q.updated_at DESC LIMIT 1""", (cutoff,),
@@ -1811,7 +1886,7 @@ class Store:
             complete = (not evidence.get("process_alive") and evidence.get("completed_log") is True
                         and evidence.get("checkpoint_exists") is True
                         and verified_epoch >= int(run["total_epochs"]) > 0)
-            if complete and job["status"] in {"failed", "running", "completed"}:
+            if complete and job["status"] in {"failed", "running", "paused", "completed"}:
                 conn.execute("UPDATE runs SET status='completed',current_epoch=MAX(current_epoch,?),ended_at=COALESCE(ended_at,?),updated_at=?,eta_seconds=0,error_message=NULL,final_metrics_json=? WHERE id=?",
                              (verified_epoch, now, now, json.dumps(last_metrics, ensure_ascii=False), run["id"]))
                 if job["status"] != "completed":
@@ -1832,10 +1907,17 @@ class Store:
         job = self.get_queue_job(job_id, True)
         if not job:
             return None
-        if not job.get("agent_id") or str(payload.get("agent_id") or "") != job["agent_id"]:
-            raise PermissionError("job lease belongs to another agent")
-        now = utc_now()
         kind = str(payload.get("kind") or "unknown")[:80]
+        verified_recovery = kind == "recovery_process_missing" and self.run_verified_complete(job.get("run_id") or "")
+        if not job.get("agent_id") or str(payload.get("agent_id") or "") != job["agent_id"]:
+            if verified_recovery and job["status"] == "completed":
+                return {**job, "_suppress_anomaly_email": True}
+            raise PermissionError("job lease belongs to another agent")
+        if verified_recovery:
+            # The process disappeared because training already finished.
+            self.repair_completed_recovery_job(job_id)
+            return {**job, "_suppress_anomaly_email": True}
+        now = utc_now()
         message = str(payload.get("message") or "")[:4000]
         suggestion = fault_suggestion(kind, job, payload.get("data") or {})
         with self.connect() as conn:
@@ -3963,6 +4045,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/v1/agents/heartbeat":
                 agent, notify = STORE.heartbeat_agent(payload)
                 current_job = STORE.get_queue_job(agent.get("current_job_id") or "", False) if agent.get("current_job_id") else None
+                if current_job:
+                    current_job.update(STORE.run_recovery_state(current_job.get("run_id") or ""))
                 if notify:
                     threading.Thread(target=self.safe_idle_email, args=(agent,), daemon=True).start()
                 self.send_json(200, {"agent": agent, "idle_reminder": notify, "current_job": current_job,
@@ -4012,7 +4096,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json(HTTPStatus.CONFLICT, {"error": "lease conflict"})
                         return
                     if job:
-                        threading.Thread(target=self.safe_anomaly_email, args=(job, payload), daemon=True).start()
+                        if not job.get("_suppress_anomaly_email"):
+                            threading.Thread(target=self.safe_anomaly_email, args=(job, payload), daemon=True).start()
                         self.send_json(200, {"job": STORE.get_queue_job(job_id, False)})
                     else:
                         self.send_json(404, {"error": "job not found"})
@@ -4112,6 +4197,12 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def safe_anomaly_email(job, payload):
         try:
+            if payload.get("kind") == "recovery_process_missing":
+                # Allow an in-flight completion callback to arrive before
+                # deciding that a vanished process is a real failure.
+                time.sleep(20)
+                if STORE.repair_completed_recovery_job(job["id"]):
+                    return
             send_anomaly_email(job, payload)
         except Exception:
             traceback.print_exc()

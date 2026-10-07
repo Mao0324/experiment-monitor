@@ -2,9 +2,12 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,6 +24,7 @@ class ReconciliationTest(unittest.TestCase):
         environment = {
             "MONITOR_DB": str(Path(self.temp.name) / "module.db"),
             "MONITOR_AI_CONFIG": str(Path(self.temp.name) / "ai.json"),
+            "MONITOR_API_TOKEN": "reconciliation-test-token",
         }
         with patch.dict(os.environ, environment):
             spec = importlib.util.spec_from_file_location("monitor_reconciliation_test", SERVER)
@@ -57,6 +61,15 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(self.store.get_run("run")["status"], "completed")
         self.assertEqual(self.store.get_queue_job("job")["status"], "completed")
         self.assertEqual(len(self.store.metric_events("run")), 3)
+
+    def test_exact_output_evidence_can_repair_a_false_recovery_pause(self):
+        with self.store.connect() as conn:
+            conn.execute("UPDATE queue_jobs SET status='paused',last_error=? WHERE id='job'",
+                         ("Agent 重启后发现原训练进程已经消失",))
+        self.assertEqual([job["id"] for job in self.store.reconciliation_jobs("worker")], ["job"])
+        self.report(True)
+        self.assertEqual(self.store.get_run("run")["status"], "completed")
+        self.assertEqual(self.store.get_queue_job("job")["status"], "completed")
 
     def test_epoch_events_sort_backfill_and_merge_duplicate_metrics(self):
         with self.store.connect() as conn:
@@ -112,6 +125,94 @@ class ReconciliationTest(unittest.TestCase):
         with patch.object(agent, "request", return_value={"job": None}) as request:
             agent.claim(gpus)
         self.assertEqual(request.call_args.args[1]["gpus"], [])
+
+    def test_completed_run_suppresses_recovery_email_and_repairs_queue(self):
+        with self.store.connect() as conn:
+            conn.execute("UPDATE runs SET status='completed',current_epoch=3 WHERE id='run'")
+            conn.execute("UPDATE queue_jobs SET status='running',agent_id='worker' WHERE id='job'")
+        with patch.object(self.module, "STORE", self.store), patch.object(self.module.Handler, "safe_anomaly_email") as email:
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.module.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                payload = json.dumps({"agent_id": "worker", "kind": "recovery_process_missing",
+                                      "message": "Agent 重启后发现原训练进程已经消失"}).encode()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/api/v1/agents/jobs/job/anomaly",
+                    data=payload, headers={"Authorization": "Bearer reconciliation-test-token",
+                                           "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                email.assert_not_called()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        self.assertEqual(self.store.get_queue_job("job")["status"], "completed")
+        self.assertEqual(self.store.agent_job_update("job", {"agent_id": "worker", "status": "paused",
+            "error": "Agent 重启后发现原训练进程已经消失"})["status"], "completed")
+        with self.store.connect() as conn:
+            kinds = [row[0] for row in conn.execute("SELECT kind FROM job_events WHERE job_id='job'")]
+        self.assertNotIn("anomaly:recovery_process_missing", kinds)
+
+    def test_late_completion_repairs_recovery_pause_but_real_failure_remains(self):
+        with self.store.connect() as conn:
+            conn.execute("UPDATE queue_jobs SET status='running',agent_id='worker' WHERE id='job'")
+        payload = {"agent_id": "worker", "kind": "recovery_process_missing",
+                   "message": "Agent 重启后发现原训练进程已经消失"}
+        self.assertFalse(self.store.record_job_anomaly("job", payload).get("_suppress_anomaly_email"))
+        self.store.agent_job_update("job", {"agent_id": "worker", "status": "paused",
+            "error": payload["message"]})
+        with self.store.connect() as conn:
+            conn.execute("UPDATE runs SET status='completed',current_epoch=3 WHERE id='run'")
+        self.assertTrue(self.store.repair_completed_recovery_job("job"))
+        self.assertEqual(self.store.get_queue_job("job")["status"], "completed")
+        with self.store.connect() as conn:
+            conn.execute("UPDATE queue_jobs SET status='running',agent_id='worker' WHERE id='job'")
+        self.store.agent_job_update("job", {"agent_id": "worker", "status": "failed",
+            "error": "training process exited with code 1"})
+        self.assertEqual(self.store.get_queue_job("job")["status"], "failed")
+        self.assertTrue(self.store.repair_completed_recovery_job("job"))
+        self.assertEqual(self.store.get_queue_job("job")["status"], "failed")
+
+    def test_delayed_recovery_email_rechecks_completion(self):
+        job = {"id": "job"}
+        payload = {"kind": "recovery_process_missing"}
+        with patch.object(self.module, "STORE", self.store), \
+             patch.object(self.module.time, "sleep") as sleep, \
+             patch.object(self.module, "send_anomaly_email") as email:
+            self.module.Handler.safe_anomaly_email(job, payload)
+            email.assert_called_once_with(job, payload)
+            self.assertEqual(sleep.call_args.args, (20,))
+            email.reset_mock()
+            with self.store.connect() as conn:
+                conn.execute("UPDATE runs SET status='completed',current_epoch=3 WHERE id='run'")
+            self.module.Handler.safe_anomaly_email(job, payload)
+            email.assert_not_called()
+
+    def test_agent_recovery_checks_completed_run_before_anomaly(self):
+        spec = importlib.util.spec_from_file_location("queue_recovery_test", AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        agent = module.Agent({"server_url": "https://example.test", "api_token": "x",
+                              "allowed_roots": [self.temp.name], "log_directory": self.temp.name})
+        agent.current_job = {"id": "job", "name": "test", "working_directory": self.temp.name}
+        agent.current_pid = 123
+        def stop_after_clear():
+            agent.stop_requested = True
+        with patch.object(agent, "process_matches", return_value=False), \
+             patch.object(agent, "gpu_status", return_value=[]), \
+             patch.object(agent, "heartbeat", return_value={"current_job": {
+                 "id": "job", "status": "running", "run_verified_complete": True}}), \
+             patch.object(agent, "discover_checkpoint", return_value=""), \
+             patch.object(agent, "update_job", return_value={}) as update, \
+             patch.object(agent, "anomaly") as anomaly, \
+             patch.object(agent, "clear_runtime", side_effect=stop_after_clear), \
+             patch.object(module.time, "sleep"):
+            agent.run_forever()
+        update.assert_called_once()
+        self.assertEqual(update.call_args.args[1], "completed")
+        anomaly.assert_not_called()
 
 
 if __name__ == "__main__":
