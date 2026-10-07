@@ -660,23 +660,33 @@ class Store:
         return [self.row_to_run(row) for row in rows]
 
     def metric_events(self, run_id: str) -> list[dict]:
+        events = []
         with self.connect() as conn:
             rows = conn.execute(
                 """SELECT epoch, batch, phase, created_at, metrics_json
                 FROM metric_events WHERE run_id=? AND phase='epoch'
-                ORDER BY id ASC LIMIT 1000""",
+                ORDER BY epoch ASC, id ASC""",
                 (run_id,),
-            ).fetchall()
-        return [
-            {
-                "epoch": row["epoch"],
-                "batch": row["batch"],
-                "phase": row["phase"],
-                "created_at": row["created_at"],
-                "metrics": safe_json(row["metrics_json"], {}),
-            }
-            for row in rows
-        ]
+            )
+            for row in rows:
+                if not events or events[-1]["epoch"] != row["epoch"]:
+                    if len(events) >= 1000:
+                        break
+                    events.append({
+                        "epoch": row["epoch"],
+                        "batch": row["batch"],
+                        "phase": row["phase"],
+                        "created_at": row["created_at"],
+                        "metrics": {},
+                    })
+                event = events[-1]
+                if row["batch"] is not None:
+                    event["batch"] = row["batch"]
+                event["created_at"] = row["created_at"]
+                metrics = safe_json(row["metrics_json"], {})
+                if isinstance(metrics, dict):
+                    event["metrics"].update(metrics)
+        return events
 
     def delete_run(self, run_id: str) -> bool:
         """Delete one run and its metric events in a single transaction."""
@@ -2633,7 +2643,7 @@ def trend_panel(sources: list[dict], compare: bool = False) -> str:
       const storageKey='yolo-monitor-metric:'+mode+':'+sources.map(s=>s.id).join(',');
       function refreshKeys(){const current=select.value||sessionStorage.getItem(storageKey);keys=[...new Set(sources.flatMap(s=>epochEvents(s).flatMap(e=>Object.keys(e.metrics))))].filter(k=>sources.some(s=>epochEvents(s).some(e=>Number.isFinite(Number(e.metrics[k])))));keys.sort((a,b)=>{const rank=k=>{const x=k.toLowerCase();const i=priority.findIndex(p=>x.includes(p));return i<0?999:i};return rank(a)-rank(b)||a.localeCompare(b)});select.replaceChildren();keys.forEach(k=>{const o=document.createElement('option');o.value=k;o.textContent=k;select.appendChild(o)});if(current&&keys.includes(current))select.value=current}
       const fmt=v=>{if(!Number.isFinite(v))return '—';const a=Math.abs(v);if(a!==0&&(a<0.0001||a>=100000))return v.toExponential(4);return Number(v.toPrecision(7)).toString()};
-      const pointsFor=(source,key)=>epochEvents(source).map(e=>({epoch:Number(e.epoch),value:Number(e.metrics[key])})).filter(p=>Number.isFinite(p.epoch)&&Number.isFinite(p.value));
+      const pointsFor=(source,key)=>{const byEpoch=new Map();epochEvents(source).forEach(e=>{if(e.metrics[key]===undefined||e.metrics[key]===null)return;const epoch=Number(e.epoch),value=Number(e.metrics[key]);if(Number.isFinite(epoch)&&Number.isFinite(value))byEpoch.set(epoch,{epoch,value})});return [...byEpoch.values()].sort((a,b)=>a.epoch-b.epoch)};
       const addStat=(label,value,accent)=>{const box=document.createElement('div');box.className='stat';if(accent)box.style.borderColor=accent;const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;box.append(l,v);stats.appendChild(box)};
       function render(){
         const key=select.value;sessionStorage.setItem(storageKey,key);stats.replaceChildren();legend.replaceChildren();tooltip.style.display='none';

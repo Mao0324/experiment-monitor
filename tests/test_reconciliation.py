@@ -58,6 +58,27 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(self.store.get_queue_job("job")["status"], "completed")
         self.assertEqual(len(self.store.metric_events("run")), 3)
 
+    def test_epoch_events_sort_backfill_and_merge_duplicate_metrics(self):
+        with self.store.connect() as conn:
+            for epoch, metrics in (
+                (4, {"metrics/mAP50(B)": 0.84}),
+                (5, {"metrics/mAP50(B)": 0.85}),
+                (1, {"metrics/mAP50(B)": 0.41}),
+                (2, {"metrics/mAP50(B)": 0.62}),
+                (3, {"metrics/mAP50(B)": 0.73}),
+                (2, {"metrics/mAP50(B)": 0.63, "val/box_loss": 1.2}),
+                (5, {"val/box_loss": 0.5}),
+            ):
+                conn.execute(
+                    "INSERT INTO metric_events(run_id,epoch,batch,phase,created_at,metrics_json) "
+                    "VALUES ('run',?,NULL,'epoch',?,?)",
+                    (epoch, self.module.utc_now(), json.dumps(metrics)),
+                )
+        events = self.store.metric_events("run")
+        self.assertEqual([event["epoch"] for event in events], [1, 2, 3, 4, 5])
+        self.assertEqual(events[1]["metrics"], {"metrics/mAP50(B)": 0.63, "val/box_loss": 1.2})
+        self.assertEqual(events[-1]["metrics"], {"metrics/mAP50(B)": 0.85, "val/box_loss": 0.5})
+
     def test_binding_mismatch_is_rejected(self):
         with self.assertRaises(ValueError):
             self.store.reconcile_job("job", {"agent_id": "worker", "output_dir": "/tmp/other", "epochs": []})
