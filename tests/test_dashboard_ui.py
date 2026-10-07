@@ -88,6 +88,11 @@ class DashboardUiTest(unittest.TestCase):
                 )
 
     def test_dashboard_counts_and_best_result_use_all_records_and_best_epoch(self):
+        with self.store.connect() as conn:
+            conn.execute(
+                "INSERT INTO metric_events(run_id,epoch,phase,created_at,metrics_json) VALUES ('child',3,'epoch',?,?)",
+                (self.module.utc_now(), '{"metrics/mAP50-95(B)": NaN}'),
+            )
         data = self.module.dashboard_payload(self.store.list_runs())
         runs = {run["id"]: run for run in data["runs"]}
         self.assertEqual(runs["child"]["display_code"], "CPD-004")

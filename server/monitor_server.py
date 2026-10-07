@@ -675,11 +675,18 @@ class Store:
                         json_extract(metrics_json, '$."metrics/mAP50-95(M)"'),
                         json_extract(metrics_json, '$."metrics/mAP50-95"')
                     )) AS best_value
-                    FROM metric_events WHERE phase='epoch' AND run_id IN ({placeholders})
+                    FROM metric_events WHERE phase='epoch' AND json_valid(metrics_json)
+                        AND run_id IN ({placeholders})
                     GROUP BY run_id""",
                     batch,
                 )
-                result.update({row["run_id"]: float(row["best_value"]) for row in rows if row["best_value"] is not None})
+                for row in rows:
+                    try:
+                        value = float(row["best_value"])
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value):
+                        result[row["run_id"]] = value
         return result
 
     def metric_events(self, run_id: str) -> list[dict]:
