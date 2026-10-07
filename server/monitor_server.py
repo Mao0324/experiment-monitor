@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -658,6 +658,29 @@ class Store:
                 "SELECT * FROM runs ORDER BY favorite DESC, started_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self.row_to_run(row) for row in rows]
+
+    def best_map50_95_by_run(self, run_ids: set[str]) -> dict[str, float]:
+        """Read the best observed detection mAP50-95, not the final Epoch value."""
+        if not run_ids:
+            return {}
+        ids = sorted(run_ids)
+        result = {}
+        with self.connect() as conn:
+            for start in range(0, len(ids), 400):
+                batch = ids[start:start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT run_id, MAX(COALESCE(
+                        json_extract(metrics_json, '$."metrics/mAP50-95(B)"'),
+                        json_extract(metrics_json, '$."metrics/mAP50-95(M)"'),
+                        json_extract(metrics_json, '$."metrics/mAP50-95"')
+                    )) AS best_value
+                    FROM metric_events WHERE phase='epoch' AND run_id IN ({placeholders})
+                    GROUP BY run_id""",
+                    batch,
+                )
+                result.update({row["run_id"]: float(row["best_value"]) for row in rows if row["best_value"] is not None})
+        return result
 
     def metric_events(self, run_id: str) -> list[dict]:
         events = []
@@ -2446,12 +2469,31 @@ STYLE = """
 @media(max-width:780px){.metadata-form{grid-template-columns:1fr}.wrap{padding:15px}.hide-small{display:none}th,td{padding:9px 5px}.chart{height:280px}.top{align-items:flex-start}.value{font-size:17px}.gpu-grid{grid-template-columns:1fr}.agent-heading{flex-direction:column}.queue-summary{width:100%}.agent-disclosure>.agent-summary{align-items:flex-start;padding:15px}.agent-summary-side{justify-content:flex-start}.agent-summary-copy .muted{font-size:12px}.agent-disclosure-body{padding:12px 15px 15px}}
 """
 
+STYLE += """
+:root{color-scheme:dark;--bg:#111214;--panel:#1b1c1f;--panel-soft:#232529;--line:#33363b;--text:#f4f4f2;--muted:#a0a4aa;--blue:#b8c9ff;--green:#70d6a2;--red:#f18b90;--amber:#f0c876;--input:#202226;--button:#f0f0ee;--button-text:#17181b;--shadow:0 10px 28px #0002}
+:root[data-theme=light]{color-scheme:light;--bg:#f7f7f5;--panel:#fff;--panel-soft:#f2f3f1;--line:#e3e5e3;--text:#1c1e20;--muted:#6b7177;--blue:#315bc1;--green:#19764f;--red:#b83e48;--amber:#875f0f;--input:#fafaf9;--button:#1e2023;--button-text:#fff;--shadow:0 8px 24px #1c1e200a}
+html{background:var(--bg)}body{background:var(--bg);color:var(--text);font:14px/1.55 Inter,"Segoe UI",system-ui,-apple-system,sans-serif;min-width:320px}a{color:var(--blue)}a:hover{text-decoration:underline}.wrap{max-width:1480px;padding:28px clamp(16px,3vw,44px)}.top{margin-bottom:25px;align-items:flex-start}.brand{font-size:24px;letter-spacing:-.04em;font-weight:760}.top-actions{justify-content:flex-end}.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:none;padding:22px;margin-bottom:18px}.panel h3{letter-spacing:-.025em}.label,.muted,th{color:var(--muted)}.value{color:var(--text);letter-spacing:-.03em}.stat{background:transparent;border:0;border-radius:0;padding:4px 2px}.grid{gap:14px}.button{background:var(--button);color:var(--button-text);border:1px solid transparent;border-radius:10px;box-shadow:none;transition:transform .15s ease,opacity .15s ease}.button:hover{opacity:.85;text-decoration:none;transform:translateY(-1px)}.button.secondary{background:var(--panel-soft);border-color:var(--line);color:var(--text)}.button.danger{background:#b54750;color:#fff}.filter-input,.chart-select,.login input,.danger-zone input{background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:10px}.filter-input:focus,.chart-select:focus,.login input:focus,.danger-zone input:focus{outline:2px solid var(--blue);outline-offset:1px}.bar{height:8px;background:var(--panel-soft)}.fill{background:var(--blue)}.metric,.tag,.summary-chip{background:var(--panel-soft);border:0;color:var(--text)}.tag{color:var(--muted)}.badge.running,.agent-state.running,.queue-status.status-running,.queue-status.status-leased{background:color-mix(in srgb,var(--blue) 17%,transparent);color:var(--blue)}.badge.completed,.agent-state,.queue-status.status-completed{background:color-mix(in srgb,var(--green) 17%,transparent);color:var(--green)}.badge.failed,.queue-status.status-failed{background:color-mix(in srgb,var(--red) 17%,transparent);color:var(--red)}.badge.stalled,.badge.paused,.queue-status.status-waiting_memory,.queue-status.status-paused{background:color-mix(in srgb,var(--amber) 19%,transparent);color:var(--amber)}.chart,.chart-tooltip,.chart-select{background:var(--panel-soft);border-color:var(--line);color:var(--text)}.chart-tooltip{box-shadow:var(--shadow)}pre{background:var(--panel-soft);color:var(--text)}.agent-card,.gpu-card,.gpu-metric,.script-info,.sweep-box{background:var(--panel-soft);border-color:var(--line);color:var(--text)}.gpu-state,.gpu-state.pending,.gpu-state.busy,.preflight-status,.queue-status.status-cancelled{border:0}.queue-task-link{color:var(--text);text-decoration-color:var(--muted)}.queue-row.queue-cancelled{background:color-mix(in srgb,var(--red) 7%,transparent)}.table-scroll{border-color:var(--line)}.danger-zone{border-color:color-mix(in srgb,var(--red) 30%,var(--line))}.agent-disclosure-body{border-color:var(--line)}.agent-disclosure>.agent-summary{color:var(--text)}.gpu-index{color:var(--text)}.gpu-memory-track{background:var(--line)}.gpu-memory-fill{background:var(--blue)}.fault-suggestion{background:var(--panel-soft);border-color:var(--line);color:var(--text)}
+table{table-layout:auto}th,td{border-bottom:1px solid var(--line)}tr:last-child td{border-bottom:0}th{font-size:12px;letter-spacing:.035em;text-transform:none;font-weight:650}.theme-toggle{font-size:13px;white-space:nowrap}.page-eyebrow{font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);font-weight:700}.page-subtitle{color:var(--muted);margin-top:4px}.summary-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:2px 0 22px}.summary-card{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:17px 19px}.summary-card .summary-label{font-size:12px;color:var(--muted)}.summary-card .summary-value{font-size:28px;font-weight:750;line-height:1.2;letter-spacing:-.045em;margin-top:8px;white-space:nowrap}.summary-card .summary-foot{font-size:11px;color:var(--muted);margin-top:5px}.summary-card[data-tone=active] .summary-value{color:var(--green)}.summary-card[data-tone=attention] .summary-value{color:var(--amber)}.summary-card[data-tone=error] .summary-value{color:var(--red)}.summary-card[data-tone=unknown] .summary-value{color:var(--muted)}
+.run-table{min-width:840px}.run-title{display:block;font-size:15px;font-weight:720;color:var(--text);line-height:1.3}.run-subtitle,.run-tertiary{display:block;color:var(--muted);font-size:12px;line-height:1.5;margin-top:3px}.run-tertiary{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}.run-cell{min-width:220px;max-width:380px}.progress-cell{min-width:145px}.progress-text{white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:650}.progress-cell .bar{margin-top:8px}.result-cell{white-space:nowrap;font-variant-numeric:tabular-nums}.result-main{font-weight:700;font-size:15px}.delta-up{color:var(--green)}.delta-down{color:var(--red)}.result-delta{display:block;font-size:12px;margin-top:3px}.time-cell{white-space:nowrap}.section-intro{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:15px}.section-intro h3{margin:0}.section-intro p{margin:3px 0 0;color:var(--muted)}
+.detail-hero{padding:24px 26px}.detail-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.detail-kpi{padding:9px 19px;border-right:1px solid var(--line);min-width:0}.detail-kpi:last-child{border-right:0}.detail-kpi .label{font-size:12px}.detail-kpi .value{font-size:clamp(20px,2.2vw,30px);font-weight:750;margin-top:8px;white-space:nowrap}.detail-meta{display:flex;gap:12px;flex-wrap:wrap;margin:17px 19px 0;color:var(--muted);font-size:12px}.detail-meta span+span::before{content:'·';margin-right:12px}.detail-hero>.bar{margin:20px 19px 0}.tab-list{display:flex;gap:3px;overflow-x:auto;border-bottom:1px solid var(--line);margin:0 0 20px;padding:0 2px}.tab-button{appearance:none;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);padding:12px 14px;font:inherit;white-space:nowrap;cursor:pointer}.tab-button[aria-selected=true]{border-color:var(--text);color:var(--text);font-weight:700}.tab-button:hover{color:var(--text)}.tab-panel[hidden]{display:none}.tab-panel>.panel{margin-bottom:16px}.tab-panel>.panel:last-child{margin-bottom:0}.metric-section{margin:0 0 27px}.metric-section h3{margin:0 0 12px}.metric-feature-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric-feature{background:var(--panel-soft);border-radius:13px;padding:16px;min-width:0}.metric-feature .label{font-size:12px}.metric-feature strong{display:block;font-size:clamp(19px,2vw,27px);letter-spacing:-.04em;margin:7px 0 3px;font-variant-numeric:tabular-nums}.metric-feature small{color:var(--muted)}.loss-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.loss-item{border-top:1px solid var(--line);padding-top:12px}.loss-item strong{display:block;font-size:18px;margin-top:3px}.notes-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.notes-grid label{display:flex;flex-direction:column;gap:7px}.notes-grid textarea{min-height:110px}.notes-grid .wide{grid-column:1/-1}.danger-zone summary{cursor:pointer;color:var(--red);font-weight:650}.danger-zone details>div{padding-top:14px}.danger-zone .confirm-name{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.env-brief{font-size:12px;color:var(--muted);margin-top:5px}.lineage-forest{display:grid;gap:17px}.lineage-tree,.lineage-tree ul{list-style:none;padding-left:0;margin:0}.lineage-tree ul{border-left:1px solid var(--line);padding-left:24px;margin-left:16px}.lineage-tree li{position:relative;margin:12px 0}.lineage-tree ul>li::before{content:'';position:absolute;width:15px;left:-24px;top:22px;border-top:1px solid var(--line)}.lineage-node{display:inline-flex;align-items:center;gap:13px;flex-wrap:wrap;padding:11px 15px;border-radius:12px;background:var(--panel-soft);max-width:100%}.lineage-node a{font-weight:700;color:var(--text)}.lineage-node .muted{font-size:12px}.lineage-node .badge{padding:2px 7px}.lineage-standalone{display:flex;gap:8px;flex-wrap:wrap}
+@media(max-width:1180px){.summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.detail-kpis,.metric-feature-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.detail-kpi:nth-child(2){border-right:0}.detail-kpi:nth-child(-n+2){border-bottom:1px solid var(--line)}}
+@media(max-width:700px){.wrap{padding:16px}.top{flex-direction:column;align-items:stretch}.top-actions{justify-content:flex-start}.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.summary-card{padding:13px}.summary-card .summary-value{font-size:23px}.detail-hero{padding:16px}.detail-kpi{padding:12px}.detail-kpi .value{font-size:20px}.metric-feature-grid,.loss-grid,.notes-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.notes-grid .wide{grid-column:1/-1}.tab-button{padding:10px}.panel{padding:17px}.detail-meta{margin:14px 12px 0}.detail-hero>.bar{margin:16px 12px 0}}
+@media(max-width:440px){.summary-grid,.metric-feature-grid,.loss-grid,.notes-grid{grid-template-columns:1fr}.detail-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.summary-card .summary-value{font-size:25px}}
+"""
+
 
 def page(title: str, body: str, refresh: int | None = None) -> str:
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">{refresh_tag}
-    <title>{html.escape(title)}</title><style>{STYLE}</style></head><body>{body}</body></html>"""
+    <title>{html.escape(title)} · MCONG Lab</title>
+    <script>try{{document.documentElement.dataset.theme=localStorage.getItem('mcong-lab-theme')||'dark'}}catch(e){{document.documentElement.dataset.theme='dark'}}</script>
+    <style>{STYLE}</style></head><body>{body}<script>
+    (()=>{{const button=document.createElement('button');button.type='button';button.className='button secondary theme-toggle';
+    const update=()=>{{const light=document.documentElement.dataset.theme==='light';button.textContent=light?'☾ 深色':'☀ 浅色';button.setAttribute('aria-label',light?'切换深色主题':'切换浅色主题');button.setAttribute('aria-pressed',String(light))}};
+    button.addEventListener('click',()=>{{const next=document.documentElement.dataset.theme==='light'?'dark':'light';document.documentElement.dataset.theme=next;try{{localStorage.setItem('mcong-lab-theme',next)}}catch(e){{}}update();window.dispatchEvent(new Event('resize'))}});
+    const actions=document.querySelector('.top-actions');if(actions)actions.prepend(button);else{{button.style.position='fixed';button.style.top='18px';button.style.right='18px';document.body.appendChild(button)}}update()}})();
+    </script></body></html>"""
 
 
 def status_badge(status: str) -> str:
@@ -2544,8 +2586,91 @@ def best_epoch_html(best: dict) -> str:
     <div class="stat"><div class="label">Best Epoch</div><div class="value">{best['epoch']}</div></div>
     <div class="stat"><div class="label">最佳指标</div><div class="value">{html.escape(display_number(best['value']))}</div><div class="label">{html.escape(best['metric_key'])}</div></div>
     <div class="stat"><div class="label">最新值</div><div class="value">{html.escape(display_number(best['latest_value']))}</div><div class="label">Epoch {best['latest_epoch']}</div></div>
-    <div class="stat"><div class="label">最新值 − 最佳值</div><div class="value">{html.escape(delta_text)}</div></div></div>
-    <div style="margin-top:12px">{metric_chips(best.get('metrics') or {})}</div>"""
+    <div class="stat"><div class="label">最新值 − 最佳值</div><div class="value">{html.escape(delta_text)}</div></div></div>"""
+
+
+CORE_METRIC_KEYS = {
+    "mAP50-95": ("metrics/mAP50-95(B)", "metrics/mAP50-95(M)", "metrics/mAP50-95"),
+    "mAP50": ("metrics/mAP50(B)", "metrics/mAP50(M)", "metrics/mAP50"),
+    "Precision": ("metrics/precision(B)", "metrics/precision(M)", "metrics/precision"),
+    "Recall": ("metrics/recall(B)", "metrics/recall(M)", "metrics/recall"),
+}
+
+
+def core_metric(metrics: dict, label: str) -> float | None:
+    for key in CORE_METRIC_KEYS[label]:
+        value = metrics.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return None
+
+
+def best_core_metric(events: list[dict], label: str) -> tuple[float | None, int | None]:
+    candidates = [
+        (value, int(event["epoch"])) for event in events
+        if isinstance(event.get("metrics"), dict)
+        if (value := core_metric(event["metrics"], label)) is not None
+    ]
+    return max(candidates, key=lambda item: item[0]) if candidates else (None, None)
+
+
+def percentage(value: float | None) -> str:
+    return f"{value * 100:.2f}%" if value is not None else "—"
+
+
+def baseline_delta_html(run: dict, current_best: float | None) -> str:
+    baseline_id = str(run.get("baseline_run_id") or "")
+    if not baseline_id:
+        return "未设置基线"
+    baseline = STORE.best_map50_95_by_run({baseline_id}).get(baseline_id)
+    if baseline is None or current_best is None:
+        return "等待可比结果"
+    delta = (current_best - baseline) * 100
+    return f'<span class="{"delta-up" if delta >= 0 else "delta-down"}">{delta:+.2f} pp</span>'
+
+
+def performance_html(events: list[dict], latest: dict) -> str:
+    cards = []
+    for label in CORE_METRIC_KEYS:
+        current = core_metric(latest, label)
+        best, epoch = best_core_metric(events, label)
+        cards.append(
+            f'<div class="metric-feature"><span class="label">{html.escape(label)}</span>'
+            f'<strong>{percentage(current)}</strong><small>最佳 {percentage(best)}'
+            f'{f" · Epoch {epoch}" if epoch is not None else ""}</small></div>'
+        )
+    return '<div class="metric-feature-grid">' + "".join(cards) + "</div>"
+
+
+def losses_html(latest: dict) -> str:
+    items = []
+    for label, key in (("Box loss", "box_loss"), ("Cls loss", "cls_loss"), ("DFL loss", "dfl_loss")):
+        train = latest.get("train/" + key)
+        val = latest.get("val/" + key)
+        if not isinstance(train, (int, float)):
+            train = None
+        if not isinstance(val, (int, float)):
+            val = None
+        items.append(
+            f'<div class="loss-item"><span class="label">{label}</span>'
+            f'<strong>{display_number(float(train)) if train is not None else "—"}</strong>'
+            f'<span class="label">验证 {display_number(float(val)) if val is not None else "—"}</span></div>'
+        )
+    return '<div class="loss-grid">' + "".join(items) + "</div>"
+
+
+def environment_brief(parameters: dict) -> str:
+    repro = parameters.get("reproducibility") if isinstance(parameters, dict) else None
+    if not isinstance(repro, dict):
+        return "环境信息待上传"
+    libraries = repro.get("libraries") or {}
+    if not isinstance(libraries, dict):
+        libraries = {}
+    parts = []
+    for key, label in (("torch", "PyTorch"), ("cuda_runtime", "CUDA"), ("ultralytics", "YOLO")):
+        if libraries.get(key):
+            parts.append(f"{label} {libraries[key]}")
+    return " · ".join(parts) if parts else "环境信息待上传"
 
 
 def reproducibility_html(parameters: dict) -> str:
@@ -2567,25 +2692,115 @@ def reproducibility_html(parameters: dict) -> str:
     return '<div style="overflow:auto"><table><tbody>' + "".join(rows) + "</tbody></table></div>"
 
 
-def dashboard_run(run: dict) -> dict:
+def experiment_display_name(name: str) -> tuple[str, str]:
+    """Keep the stored run name unchanged; only humanize known series IDs."""
+    match = re.match(r"^([A-Za-z]{2,8})[-_ ]?(\d{3})(?:[-_ ]+(.*))?$", name)
+    if not match:
+        return name, ""
+    code = f"{match.group(1).upper()}-{match.group(2)}"
+    details = " · ".join(part for part in re.split(r"[_-]+", match.group(3) or "") if part)
+    return code, details
+
+
+def dashboard_run(run: dict, best_values: dict[str, float] | None = None) -> dict:
     keys = (
         "id", "name", "status", "total_epochs", "current_epoch", "started_at",
-        "updated_at", "elapsed_seconds", "group_name", "tags", "favorite",
+        "updated_at", "elapsed_seconds", "group_name", "tags", "favorite", "baseline_run_id",
         "metadata_revision",
     )
-    return {key: run.get(key) for key in keys}
+    result = {key: run.get(key) for key in keys}
+    result["display_code"], result["display_subtitle"] = experiment_display_name(str(run.get("name") or ""))
+    reproducibility = (run.get("parameters") or {}).get("reproducibility") or {}
+    result["git_short"] = str((reproducibility.get("git") or {}).get("commit") or "")[:12]
+    best_values = best_values or {}
+    best = best_values.get(str(run.get("id") or ""))
+    baseline = best_values.get(str(run.get("baseline_run_id") or ""))
+    result["best_map50_95"] = best
+    result["baseline_delta_pp"] = round((best - baseline) * 100, 4) if best is not None and baseline is not None else None
+    return result
+
+
+def dashboard_summary() -> dict:
+    """Counts use the whole database, while the table may show only recent runs."""
+    now_cst = datetime.now(timezone(timedelta(hours=8)))
+    day_start = now_cst.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    with STORE.connect() as conn:
+        statuses = {row["status"]: row["count"] for row in conn.execute(
+            "SELECT status,COUNT(*) AS count FROM runs GROUP BY status"
+        )}
+        queued = conn.execute(
+            "SELECT COUNT(*) FROM queue_jobs WHERE status IN ('queued','waiting_memory')"
+        ).fetchone()[0]
+        finished_today = conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE status='completed' AND ended_at>=? AND ended_at<?",
+            (day_start.isoformat(timespec="seconds"), day_end.isoformat(timespec="seconds")),
+        ).fetchone()[0]
+    gpus = {}
+    now = datetime.now(timezone.utc)
+    for agent in STORE.list_agents():
+        try:
+            heartbeat = datetime.fromisoformat(str(agent.get("updated_at") or ""))
+            if heartbeat.tzinfo is None or (now - heartbeat).total_seconds() > 120:
+                continue
+        except ValueError:
+            continue
+        host = str(agent.get("hostname") or agent.get("id") or "unknown")
+        caps = agent.get("capabilities") or {}
+        for gpu in agent.get("gpus") or []:
+            if not isinstance(gpu, dict):
+                continue
+            key = (host, str(gpu.get("index", "")))
+            if key in gpus:
+                continue
+            try:
+                used = float(gpu.get("memory_used_mb") or 0)
+                utilization = float(gpu.get("utilization_percent") or 0)
+                busy = (used > float(caps.get("idle_memory_used_mb", 3000)) or
+                        utilization > float(caps.get("idle_utilization_percent", 5)))
+            except (TypeError, ValueError):
+                busy = None
+            if gpu.get("cuda_usable") is False or gpu.get("telemetry_usable") is False:
+                busy = None
+            gpus[key] = busy
+    usable = [busy for busy in gpus.values() if busy is not None]
+    return {
+        "running": statuses.get("running", 0),
+        "queued": queued,
+        "completed": statuses.get("completed", 0),
+        "failed": statuses.get("failed", 0),
+        "stalled": statuses.get("stalled", 0),
+        "gpu_busy": sum(usable),
+        "gpu_total": len(usable),
+        "completed_today": finished_today,
+    }
+
+
+def dashboard_payload(runs: list[dict] | None = None) -> dict:
+    runs = runs if runs is not None else STORE.list_runs()
+    related_ids = {str(run["id"]) for run in runs}
+    related_ids.update(str(run.get("baseline_run_id")) for run in runs if run.get("baseline_run_id"))
+    best_values = STORE.best_map50_95_by_run(related_ids)
+    return {"runs": [dashboard_run(run, best_values) for run in runs], "summary": dashboard_summary()}
 
 
 def run_snapshot(run: dict, events: list[dict]) -> dict:
     best = best_epoch_info(events)
+    latest = latest_metrics_for(run, events)
+    best_map, _ = best_core_metric(events, "mAP50-95")
     return {
         "run": run,
         "events": events,
         "best": best,
         "fragments": {
             "status": status_badge(run["status"]),
-            "metrics": metric_chips(latest_metrics_for(run, events)),
+            "metrics": metric_chips(latest),
             "best": best_epoch_html(best),
+            "best_map": percentage(best_map),
+            "baseline_delta": baseline_delta_html(run, best_map),
+            "performance": performance_html(events, latest),
+            "losses": losses_html(latest),
+            "environment_brief": environment_brief(run.get("parameters") or {}),
             "host": host_status_html(run.get("host_status") or {}),
             "result": metric_chips(run.get("result") or {}),
             "reproducibility": reproducibility_html(run.get("parameters") or {}),
@@ -2647,7 +2862,9 @@ def trend_panel(sources: list[dict], compare: bool = False) -> str:
       const addStat=(label,value,accent)=>{const box=document.createElement('div');box.className='stat';if(accent)box.style.borderColor=accent;const l=document.createElement('div');l.className='label';l.textContent=label;const v=document.createElement('div');v.className='value';v.textContent=value;box.append(l,v);stats.appendChild(box)};
       function render(){
         const key=select.value;sessionStorage.setItem(storageKey,key);stats.replaceChildren();legend.replaceChildren();tooltip.style.display='none';
-        const series=sources.map((s,i)=>({...s,color:colors[i%colors.length],dash:dashes[i%dashes.length],points:pointsFor(s,key)}));
+        const light=document.documentElement.dataset.theme==='light',palette=light?['#315bc1','#a6631a','#19764f','#7550aa','#b83e48']:colors;
+        const chartStyle=getComputedStyle(document.documentElement),axisColor=chartStyle.getPropertyValue('--muted').trim(),gridColor=chartStyle.getPropertyValue('--line').trim();
+        const series=sources.map((s,i)=>({...s,color:palette[i%palette.length],dash:dashes[i%dashes.length],points:pointsFor(s,key)}));
         const all=series.flatMap(s=>s.points); const drawable=series.some(s=>s.points.length>=2);
         if(mode==='single'&&all.length){const vals=all.map(p=>p.value);addStat('最新值',fmt(all[all.length-1].value));addStat('最小值',fmt(Math.min(...vals)));addStat('最大值',fmt(Math.max(...vals)));addStat('Epoch 数据点',String(all.length))}
         if(mode==='compare')series.forEach(s=>{const p=s.points[s.points.length-1];addStat(s.name,p?('Epoch '+p.epoch+' · '+fmt(p.value)):'无此指标',s.color)});
@@ -2659,9 +2876,9 @@ def trend_panel(sources: list[dict], compare: bool = False) -> str:
         let xmin=Math.min(...all.map(p=>p.epoch)),xmax=Math.max(...all.map(p=>p.epoch));if(xmin===xmax){xmin-=0.5;xmax+=0.5}
         const xp=e=>left+(e-xmin)/(xmax-xmin)*pw,yp=v=>top+(ymax-v)/(ymax-ymin)*ph;
         ctx.font='12px ui-monospace,monospace';ctx.textBaseline='middle';ctx.lineWidth=1;ctx.setLineDash([]);
-        for(let i=0;i<=5;i++){const y=top+ph*i/5,val=ymax-(ymax-ymin)*i/5;ctx.strokeStyle='#263452';ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillStyle='#97a6c4';ctx.textAlign='right';ctx.fillText(fmt(val),left-10,y)}
-        const xTicks=Math.min(5,Math.max(1,Math.round(xmax-xmin)));ctx.textAlign='center';for(let i=0;i<=xTicks;i++){const e=xmin+(xmax-xmin)*i/xTicks,x=xp(e);ctx.fillStyle='#97a6c4';ctx.fillText(String(Math.round(e)),x,h-bottom+22)}
-        ctx.fillStyle='#97a6c4';ctx.fillText('Epoch',left+pw/2,h-12);
+        for(let i=0;i<=5;i++){const y=top+ph*i/5,val=ymax-(ymax-ymin)*i/5;ctx.strokeStyle=gridColor;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillStyle=axisColor;ctx.textAlign='right';ctx.fillText(fmt(val),left-10,y)}
+        const xTicks=Math.min(5,Math.max(1,Math.round(xmax-xmin)));ctx.textAlign='center';for(let i=0;i<=xTicks;i++){const e=xmin+(xmax-xmin)*i/xTicks,x=xp(e);ctx.fillStyle=axisColor;ctx.fillText(String(Math.round(e)),x,h-bottom+22)}
+        ctx.fillStyle=axisColor;ctx.fillText('Epoch',left+pw/2,h-12);
         series.forEach(s=>{if(!s.points.length)return;ctx.strokeStyle=s.color;ctx.fillStyle=s.color;ctx.lineWidth=2;ctx.setLineDash(s.dash);if(s.points.length>=2){ctx.beginPath();s.points.forEach((p,i)=>{const x=xp(p.epoch),y=yp(p.value);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}ctx.setLineDash([]);s.points.forEach(p=>{const x=xp(p.epoch),y=yp(p.value);ctx.beginPath();ctx.arc(x,y,3.5,0,Math.PI*2);ctx.fill();hitPoints.push({x,y,p,s})})});
       }
       select.addEventListener('change',render);window.addEventListener('resize',render);window.updateTrendSources=next=>{sources=next;refreshKeys();render()};
@@ -2677,28 +2894,103 @@ def trend_panel(sources: list[dict], compare: bool = False) -> str:
 
 
 def dashboard_html(runs: list[dict]) -> str:
-    run_json = json.dumps([dashboard_run(run) for run in runs], ensure_ascii=False).replace("</", "<\\/")
-    template = """<div class="wrap"><div class="top"><div><div class="brand">YOLO 实验监控</div><div class="muted"><span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span></div></div><div class="top-actions"><a class="button secondary" href="/queue">实验队列 / Agent</a><a class="button secondary" href="/ai">AI 配置</a><a class="button secondary" href="/logout">退出登录</a></div></div>
-    <div class="panel"><div class="controls"><input id="nameFilter" class="filter-input" type="search" placeholder="搜索实验名称"><select id="statusFilter" class="filter-input"><option value="">全部状态</option><option value="running">运行中</option><option value="stalled">疑似卡住/掉线</option><option value="completed">已完成</option><option value="failed">失败</option></select><select id="groupFilter" class="filter-input"><option value="">全部分组</option></select><select id="tagFilter" class="filter-input"><option value="">全部标签</option></select><label class="controls"><input id="favoriteFilter" type="checkbox">只看收藏</label><span id="visibleCount" class="muted"></span></div></div>
-    <form id="compareForm" method="get" action="/compare"><div class="panel"><div class="top" style="margin-bottom:10px"><div><strong>实验记录</strong><div class="muted">勾选 2–5 条记录后比较同一个指标</div></div><button class="button secondary" type="submit">对比所选实验</button></div><div style="overflow:auto"><table><thead><tr><th>选择</th><th>收藏</th><th>实验 / 分组 / 标签</th><th>状态</th><th>进度</th><th class="hide-small">耗时</th><th class="hide-small">最后更新</th></tr></thead><tbody id="runRows"></tbody></table></div></div></form>
+    payload_json = json.dumps(dashboard_payload(runs), ensure_ascii=False).replace("</", "<\\/")
+    template = """<div class="wrap"><div class="top"><div><div class="page-eyebrow">Research workspace</div><div class="brand">MCONG Lab</div><div class="page-subtitle"><span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span> · 实验总览</div></div><div class="top-actions"><a class="button secondary" href="/lineage">实验谱系</a><a class="button secondary" href="/queue">队列 / Agent</a><a class="button secondary" href="/ai">AI 配置</a><a class="button secondary" href="/logout">退出登录</a></div></div>
+    <section class="summary-grid" aria-label="平台状态总览">
+      <div class="summary-card" data-tone="active"><div class="summary-label">运行中</div><div id="summaryRunning" class="summary-value">—</div><div class="summary-foot">实时实验</div></div>
+      <div class="summary-card"><div class="summary-label">排队中</div><div id="summaryQueued" class="summary-value">—</div><div class="summary-foot">包含等待显存</div></div>
+      <div class="summary-card"><div class="summary-label">已完成</div><div id="summaryCompleted" class="summary-value">—</div><div class="summary-foot">全部历史记录</div></div>
+      <div class="summary-card" data-tone="error"><div class="summary-label">失败</div><div id="summaryFailed" class="summary-value">—</div><div id="summaryFailedFoot" class="summary-foot">需要处理的记录</div></div>
+      <div class="summary-card"><div class="summary-label">GPU Busy</div><div id="summaryGpu" class="summary-value">—</div><div id="summaryGpuFoot" class="summary-foot">训练机遥测</div></div>
+      <div class="summary-card"><div class="summary-label">今日完成</div><div id="summaryToday" class="summary-value">—</div><div class="summary-foot">北京时间 00:00 起</div></div>
+    </section>
+    <div class="panel"><div class="controls"><input id="nameFilter" class="filter-input" type="search" placeholder="搜索编号或实验名称" aria-label="搜索实验"><select id="statusFilter" class="filter-input"><option value="">全部状态</option><option value="running">运行中</option><option value="stalled">疑似卡住/掉线</option><option value="completed">已完成</option><option value="failed">失败</option></select><select id="groupFilter" class="filter-input"><option value="">全部分组</option></select><select id="tagFilter" class="filter-input"><option value="">全部标签</option></select><label class="controls"><input id="favoriteFilter" type="checkbox">只看收藏</label><span id="visibleCount" class="muted"></span></div></div>
+    <form id="compareForm" method="get" action="/compare"><div class="panel"><div class="section-intro"><div><h3>实验记录</h3><p>编号、进度与最佳检测性能一目了然</p></div><button class="button secondary" type="submit">对比所选实验</button></div><div style="overflow:auto"><table class="run-table"><thead><tr><th>对比</th><th>收藏</th><th>实验</th><th>状态</th><th>进度</th><th>Best mAP50-95</th><th>最后更新</th><th class="hide-small">耗时</th></tr></thead><tbody id="runRows"></tbody></table></div></div></form>
     <script>
     (()=>{
-      let runs=__RUNS__;const rows=document.getElementById('runRows'),form=document.getElementById('compareForm');
+      const initial=__PAYLOAD__;let runs=initial.runs||[];const rows=document.getElementById('runRows'),form=document.getElementById('compareForm');
       const nameFilter=document.getElementById('nameFilter'),statusFilter=document.getElementById('statusFilter'),groupFilter=document.getElementById('groupFilter'),tagFilter=document.getElementById('tagFilter'),favoriteFilter=document.getElementById('favoriteFilter');
       const selectionKey='yolo-monitor-compare-selection';let selected=new Set();try{selected=new Set(JSON.parse(sessionStorage.getItem(selectionKey)||'[]'))}catch(e){}
       const statusLabels={running:'运行中',stalled:'疑似卡住/掉线',completed:'已完成',failed:'失败'};
       const duration=value=>{if(value===null||value===undefined)return '—';let s=Math.max(0,Math.floor(Number(value)||0)),h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;return h?(h+'小时 '+m+'分'):(m?(m+'分 '+s+'秒'):(s+'秒'))};
+      const dateFormat=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+      const dateParts=date=>Object.fromEntries(dateFormat.formatToParts(date).filter(x=>x.type!=='literal').map(x=>[x.type,x.value]));
+      const dateKey=date=>{const p=dateParts(date);return p.year+'-'+p.month+'-'+p.day};
+      const timeLabel=value=>{if(!value)return {short:'—',full:''};const date=new Date(value);if(!Number.isFinite(date.getTime()))return {short:'—',full:String(value)};const p=dateParts(date),full=p.year+'-'+p.month+'-'+p.day+' '+p.hour+':'+p.minute+':'+p.second+' CST',mins=Math.max(0,Math.floor((Date.now()-date.getTime())/60000));let short;if(mins<1)short='刚刚';else if(mins<60)short=mins+' 分钟前';else if(mins<24*60)short=Math.floor(mins/60)+' 小时前';else if(dateKey(date)===dateKey(new Date(Date.now()-86400000)))short='昨天 '+p.hour+':'+p.minute;else short=p.month+'月'+p.day+'日 '+p.hour+':'+p.minute;return {short,full}};
       const add=(parent,tag,text,className)=>{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;parent.appendChild(node);return node};
+      function renderSummary(s){const data=s||{};for(const [id,key] of [['summaryRunning','running'],['summaryQueued','queued'],['summaryCompleted','completed'],['summaryFailed','failed'],['summaryToday','completed_today']])document.getElementById(id).textContent=data[key]??'—';document.getElementById('summaryGpu').textContent=data.gpu_total?data.gpu_busy+' / '+data.gpu_total:'—';document.getElementById('summaryGpuFoot').textContent=data.gpu_total?'按 Agent 空闲阈值判定':'暂无新鲜 GPU 遥测';document.getElementById('summaryFailedFoot').textContent=data.stalled?'另有 '+data.stalled+' 条疑似掉线':'需要处理的记录'}
       function updateOptions(select,values,label){const current=select.value;select.replaceChildren();const first=document.createElement('option');first.value='';first.textContent=label;select.appendChild(first);[...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-CN')).forEach(value=>{const o=document.createElement('option');o.value=value;o.textContent=value;select.appendChild(o)});if([...select.options].some(o=>o.value===current))select.value=current}
       function refreshFilterOptions(){updateOptions(groupFilter,runs.map(r=>r.group_name),'全部分组');updateOptions(tagFilter,runs.flatMap(r=>r.tags||[]),'全部标签')}
-      function matches(run){const q=nameFilter.value.trim().toLowerCase();return(!q||String(run.name).toLowerCase().includes(q))&&(!statusFilter.value||run.status===statusFilter.value)&&(!groupFilter.value||run.group_name===groupFilter.value)&&(!tagFilter.value||(run.tags||[]).includes(tagFilter.value))&&(!favoriteFilter.checked||run.favorite)}
-      async function setFavorite(run,value){const password=prompt('收藏操作需要管理员密码：');if(password===null)return;const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(run.id)+'/metadata',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify({favorite:value,password})});if(!response.ok)alert(response.status===403?'管理员密码错误':'收藏更新失败');}
-      function render(){rows.replaceChildren();const visible=runs.filter(matches);document.getElementById('visibleCount').textContent='显示 '+visible.length+' / '+runs.length;visible.forEach(run=>{const tr=document.createElement('tr');const choose=add(tr,'td');const cb=document.createElement('input');cb.type='checkbox';cb.name='run';cb.value=run.id;cb.className='compare-box';cb.checked=selected.has(run.id);cb.setAttribute('aria-label','选择 '+run.name);cb.addEventListener('change',()=>{cb.checked?selected.add(run.id):selected.delete(run.id);sessionStorage.setItem(selectionKey,JSON.stringify([...selected]))});choose.appendChild(cb);const favCell=add(tr,'td');const star=add(favCell,'button',run.favorite?'★':'☆','favorite-button'+(run.favorite?' active':''));star.type='button';star.title=run.favorite?'取消收藏':'收藏实验';star.addEventListener('click',()=>setFavorite(run,!run.favorite));const info=add(tr,'td');const link=add(info,'a',run.name);link.href='/runs/'+encodeURIComponent(run.id);add(info,'br');add(info,'span',run.id.slice(0,12),'label');if(run.group_name){add(info,'span',' · '+run.group_name,'label')}add(info,'br');(run.tags||[]).forEach(tag=>add(info,'span',tag,'tag'));const status=add(tr,'td');add(status,'span',statusLabels[run.status]||run.status,'badge '+run.status);const progress=add(tr,'td');add(progress,'span',(run.current_epoch||0)+' / '+(run.total_epochs||0));const bar=add(progress,'div',undefined,'bar');const fill=add(bar,'div',undefined,'fill');fill.style.width=(run.total_epochs?Math.min(100,100*(run.current_epoch||0)/run.total_epochs):0)+'%';add(tr,'td',duration(run.elapsed_seconds),'hide-small');add(tr,'td',run.updated_at||'—','hide-small');rows.appendChild(tr)});if(!visible.length){const tr=document.createElement('tr'),td=add(tr,'td','没有符合筛选条件的实验','empty');td.colSpan=7;rows.appendChild(tr)}}
+      function matches(run){const q=nameFilter.value.trim().toLowerCase();return(!q||[run.name,run.display_code,run.display_subtitle].some(v=>String(v||'').toLowerCase().includes(q)))&&(!statusFilter.value||run.status===statusFilter.value)&&(!groupFilter.value||run.group_name===groupFilter.value)&&(!tagFilter.value||(run.tags||[]).includes(tagFilter.value))&&(!favoriteFilter.checked||run.favorite)}
+      async function setFavorite(run,value){const password=prompt('收藏操作需要管理员密码：');if(password===null)return;const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(run.id)+'/metadata',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify({favorite:value,password})});if(!response.ok)alert(response.status===403?'管理员密码错误':'收藏更新失败');else{run.favorite=value;render()}}
+      function render(){rows.replaceChildren();const visible=runs.filter(matches);document.getElementById('visibleCount').textContent='显示 '+visible.length+' / '+runs.length+' 条近期记录';visible.forEach(run=>{const tr=document.createElement('tr');const choose=add(tr,'td');const cb=document.createElement('input');cb.type='checkbox';cb.name='run';cb.value=run.id;cb.className='compare-box';cb.checked=selected.has(run.id);cb.setAttribute('aria-label','选择 '+run.name);cb.addEventListener('change',()=>{cb.checked?selected.add(run.id):selected.delete(run.id);sessionStorage.setItem(selectionKey,JSON.stringify([...selected]))});choose.appendChild(cb);const favCell=add(tr,'td');const star=add(favCell,'button',run.favorite?'★':'☆','favorite-button'+(run.favorite?' active':''));star.type='button';star.title=run.favorite?'取消收藏':'收藏实验';star.addEventListener('click',()=>setFavorite(run,!run.favorite));const info=add(tr,'td',undefined,'run-cell');const link=add(info,'a',run.display_code||run.name,'run-title');link.href='/runs/'+encodeURIComponent(run.id);link.title=run.name;if(run.display_subtitle)add(info,'span',run.display_subtitle,'run-subtitle');if(run.group_name)add(info,'span',run.group_name,'run-subtitle');const tertiary=add(info,'span',run.git_short?'Git '+run.git_short:'Run '+run.id.slice(0,12),'run-tertiary');tertiary.title=run.name;(run.tags||[]).forEach(tag=>add(info,'span',tag,'tag'));const status=add(tr,'td');add(status,'span',statusLabels[run.status]||run.status,'badge '+run.status);const progress=add(tr,'td',undefined,'progress-cell');const pct=run.total_epochs?Math.min(100,Math.round(100*(run.current_epoch||0)/run.total_epochs)):0;add(progress,'span',(run.current_epoch||0)+' / '+(run.total_epochs||0)+' · '+pct+'%','progress-text');const bar=add(progress,'div',undefined,'bar');add(bar,'div',undefined,'fill').style.width=pct+'%';const result=add(tr,'td',undefined,'result-cell');if(run.best_map50_95!==null&&run.best_map50_95!==undefined){add(result,'span',Number(run.best_map50_95).toFixed(4),'result-main');if(run.baseline_delta_pp!==null&&run.baseline_delta_pp!==undefined){const d=Number(run.baseline_delta_pp);add(result,'span',(d>=0?'↑ +':'↓ ')+d.toFixed(2)+' pp','result-delta '+(d>=0?'delta-up':'delta-down'))}}else add(result,'span','—','muted');const updated=add(tr,'td',undefined,'time-cell');const time=timeLabel(run.updated_at);add(updated,'span',time.short);updated.title=time.full;add(tr,'td',duration(run.elapsed_seconds),'hide-small');rows.appendChild(tr)});if(!visible.length){const tr=document.createElement('tr'),td=add(tr,'td','没有符合筛选条件的实验','empty');td.colSpan=8;rows.appendChild(tr)}}
       [nameFilter,statusFilter,groupFilter,tagFilter,favoriteFilter].forEach(control=>control.addEventListener('input',render));form.addEventListener('submit',e=>{const ids=[...form.querySelectorAll('input[name=run]:checked')].map(x=>x.value);if(ids.length<2||ids.length>5){e.preventDefault();alert('请选择 2–5 条实验记录进行对比。')}else sessionStorage.removeItem(selectionKey)});
-      const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText'),stream=new EventSource('/events/dashboard');stream.onopen=()=>{dot.classList.remove('offline');liveText.textContent='实时连接正常'};stream.onerror=()=>{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'};stream.onmessage=event=>{const data=JSON.parse(event.data);runs=data.runs||[];refreshFilterOptions();render()};refreshFilterOptions();render();
+      const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText'),stream=new EventSource('/events/dashboard');stream.onopen=()=>{dot.classList.remove('offline');liveText.textContent='实时连接正常'};stream.onerror=()=>{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'};stream.onmessage=event=>{const data=JSON.parse(event.data);runs=data.runs||[];renderSummary(data.summary);refreshFilterOptions();render()};renderSummary(initial.summary);refreshFilterOptions();render();setInterval(render,60000);
     })();
     </script></div>"""
-    return page("YOLO 实验监控", template.replace("__RUNS__", run_json))
+    return page("实验总览", template.replace("__PAYLOAD__", payload_json))
+
+
+def lineage_html(runs: list[dict]) -> str:
+    """Only draw stored baseline links; do not infer ancestry from similar names."""
+    by_id = {run["id"]: run for run in runs}
+    children: dict[str, list[dict]] = {}
+    connected = set()
+    for run in runs:
+        parent_id = str(run.get("baseline_run_id") or "")
+        if not parent_id or parent_id == run["id"]:
+            continue
+        connected.add(run["id"])
+        if parent_id in by_id:
+            connected.add(parent_id)
+            children.setdefault(parent_id, []).append(run)
+    for descendants in children.values():
+        descendants.sort(key=lambda run: (str(run.get("name") or ""), run["id"]))
+    best_values = STORE.best_map50_95_by_run(set(by_id))
+
+    def node(run: dict, ancestors: frozenset[str] = frozenset()) -> str:
+        run_id = run["id"]
+        code, detail = experiment_display_name(str(run.get("name") or ""))
+        score = best_values.get(run_id)
+        score_text = f"Best mAP50-95 {percentage(score)}" if score is not None else "暂无 mAP50-95"
+        missing_parent = bool(run.get("baseline_run_id") and run["baseline_run_id"] not in by_id)
+        body = (
+            f'<div class="lineage-node"><a href="/runs/{quote(run_id)}" title="{html.escape(run["name"])}">'
+            f'{html.escape(code)}</a><span class="muted">{html.escape(detail)}</span>'
+            f'<span class="muted">{html.escape(score_text)}</span>{status_badge(run["status"])}'
+            f'{"<span class=muted>父记录不在当前范围</span>" if missing_parent else ""}</div>'
+        )
+        if run_id in ancestors:
+            return f"<li>{body}<span class=muted>谱系循环，已停止展开</span></li>"
+        descendants = children.get(run_id, [])
+        branch = "<ul>" + "".join(node(child, ancestors | {run_id}) for child in descendants) + "</ul>" if descendants else ""
+        return f"<li>{body}{branch}</li>"
+
+    roots = [run for run in runs if run["id"] in connected and str(run.get("baseline_run_id") or "") not in by_id]
+    placed = set()
+    def collect(run: dict):
+        if run["id"] in placed:
+            return
+        placed.add(run["id"])
+        for child in children.get(run["id"], []):
+            collect(child)
+    for root in roots:
+        collect(root)
+    for run in runs:
+        if run["id"] in connected and run["id"] not in placed:
+            roots.append(run)
+            collect(run)
+    forest = "".join(f'<ul class="lineage-tree">{node(run)}</ul>' for run in roots)
+    if not forest:
+        forest = '<p class="muted">目前没有明确绑定的父子实验。可在实验记录里填写基线 Run ID，或让 Agent 根据 YAML 父实验自动绑定。</p>'
+    standalone = [run for run in runs if run["id"] not in connected]
+    standalone_html = "".join(
+        f'<a class="summary-chip" href="/runs/{quote(run["id"])}" title="{html.escape(run["name"])}">'
+        f'{html.escape(experiment_display_name(run["name"])[0])}</a>' for run in standalone
+    )
+    return page("实验谱系", f'''<div class="wrap"><div class="top"><div><a href="/">← 实验总览</a><div class="page-eyebrow">Research lineage</div><div class="brand">实验谱系</div><div class="page-subtitle">仅展示明确的基线关系，不按名称猜测父实验。</div></div><div class="top-actions"><a class="button secondary" href="/queue">队列 / Agent</a></div></div>
+    <div class="panel"><div class="section-intro"><h3>父子实验</h3><span class="muted">节点显示各自历史最佳 mAP50-95</span></div><div class="lineage-forest">{forest}</div></div>
+    <details class="panel"><summary>未关联实验 · {len(standalone)} 条</summary><div class="lineage-standalone" style="margin-top:15px">{standalone_html or '<span class="muted">暂无</span>'}</div></details></div>''')
 
 
 def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = None) -> str:
@@ -2986,25 +3278,31 @@ def run_html(run: dict, events: list[dict]) -> str:
     <div id="aiEmpty" class="empty" style="display:{'none' if ai_report else 'block'}">配置模型后可自动或手动生成详细结论。</div></div>'''
     metadata_fields = ("hypothesis", "change_notes", "result_notes", "conclusion", "next_step", "baseline_run_id")
     metadata_complete = sum(1 for field in metadata_fields if str(run.get(field) or "").strip())
-    return page(run["name"], f"""<div class="wrap"><div class="top"><div><a href="/">← 全部实验</a><div class="brand">{html.escape(run['name'])}</div><div class="muted"><span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span></div></div><div class="top-actions">{clone_button}<div id="statusBadge">{status_badge(run['status'])}</div><a class="button secondary" href="/logout">退出登录</a></div></div>
-    <div class="panel"><div class="grid"><div class="stat"><div class="label">Epoch</div><div id="epochValue" class="value">{run['current_epoch']} / {total}</div></div><div class="stat"><div class="label">Batch</div><div id="batchValue" class="value">{run.get('current_batch') or '—'} / {run.get('total_batches') or '—'}</div></div><div class="stat"><div class="label">已运行</div><div id="elapsedValue" class="value">{human_duration(run.get('elapsed_seconds'))}</div></div><div class="stat"><div class="label">预计剩余</div><div id="etaValue" class="value">{human_duration(run.get('eta_seconds'))}</div></div></div><br><div class="bar"><div id="progressFill" class="fill" style="width:{pct:.1f}%"></div></div></div>
-    <div class="panel"><h3>最新 / 最终指标</h3><div id="latestMetrics">{metric_chips(latest_metrics)}</div></div>
-    <div class="panel"><h3>最佳 Epoch</h3><div id="bestEpoch">{best_epoch_html(best)}</div></div>{chart}
-    <div class="panel"><h3>GPU / 主机状态</h3><div id="hostStatus">{host_status_html(run.get('host_status') or {})}</div></div>{artifact_panel}
-    <div class="panel"><h3>实时日志尾部</h3><div class="muted">SSE 实时更新；保留最近约 12,000 个字符。</div><pre id="logTail" class="log-tail">{log_text}</pre></div>
-    <div class="panel"><h3>可复现信息</h3><div id="reproducibility">{reproducibility_html(run.get('parameters') or {})}</div></div>{lineage_panel}
-    <div class="panel"><h3>相对基线的模型配置差异</h3><pre>{html.escape(summary.get('config_diff') or '设置基线 Run ID 且新旧实验都上传模型 YAML 后，将自动显示逐行差异。')}</pre></div>{ai_panel}
-    <div class="panel"><div class="panel-heading"><h3>分组、标签、收藏与实验笔记</h3><span class="summary-chip">核心记录完整度 <strong>{metadata_complete} / {len(metadata_fields)}</strong></span></div><form id="metadataForm" class="metadata-form"><label><span class="label">分组</span><input id="groupName" class="filter-input" maxlength="80" value="{html.escape(run.get('group_name') or '')}" placeholder="例如 DroneVehicle"></label><label><span class="label">标签（逗号分隔）</span><input id="tagsInput" class="filter-input" value="{html.escape(', '.join(run.get('tags') or []))}" placeholder="PaperLAF, FP32Safe, baseline"></label><label><span class="label">管理员密码</span><input id="metadataPassword" class="filter-input" type="password" autocomplete="current-password" required></label><label class="controls"><input id="favoriteInput" type="checkbox" {'checked' if run.get('favorite') else ''}>收藏</label><label><span class="label">实验假设</span><textarea id="hypothesis" class="filter-input" placeholder="系统会补充客观默认值；请改写为可证伪的预期">{html.escape(run.get('hypothesis') or '')}</textarea></label><label><span class="label">修改内容</span><textarea id="changeNotes" class="filter-input" placeholder="显式 YAML 父实验说明会自动写入；否则请记录唯一改动">{html.escape(run.get('change_notes') or '')}</textarea></label><label><span class="label">结果记录</span><textarea id="resultNotes" class="filter-input" placeholder="完成训练后自动写入最佳核心指标">{html.escape(run.get('result_notes') or '')}</textarea></label><label><span class="label">结论</span><textarea id="conclusion" class="filter-input" placeholder="绑定 baseline 后自动生成客观差值，不替代人工判断">{html.escape(run.get('conclusion') or '')}</textarea></label><label><span class="label">下一步</span><textarea id="nextStep" class="filter-input" placeholder="系统根据状态和 baseline 完整性给出下一步">{html.escape(run.get('next_step') or '')}</textarea></label><label><span class="label">基线 Run ID</span><input id="baselineRunId" class="filter-input" maxlength="80" value="{html.escape(run.get('baseline_run_id') or '')}" placeholder="仅对显式父实验自动绑定；不会模糊猜测"></label><button class="button secondary" type="submit">保存全部信息</button></form><div id="metadataMessage" class="muted" style="margin-top:8px">系统只补空字段且不会覆盖人工内容；敏感修改仍需管理员密码。</div></div>
-    <div class="panel"><h3>结果信息</h3><div id="resultMetrics">{metric_chips(run['result'])}</div></div><div id="dynamicError" class="panel" style="display:{'block' if run.get('error_message') else 'none'}"><h3>错误信息</h3><pre id="dynamicErrorText">{html.escape(run.get('error_message') or '')}</pre></div>
-    <div class="panel danger-zone"><h3>删除实验记录</h3><p class="muted">此操作会永久删除该实验及全部指标，无法恢复。请输入管理员密码确认。</p>
-    <form method="post" action="/runs/{quote(run['id'])}/delete" onsubmit="return confirm('确定永久删除这条实验记录吗？此操作无法恢复。')"><input type="password" name="password" autocomplete="current-password" placeholder="管理员密码" required><button class="button danger" type="submit">永久删除</button></form></div>
+    display_code, display_subtitle = experiment_display_name(run["name"])
+    best_map, _ = best_core_metric(events, "mAP50-95")
+    environment = environment_brief(run.get("parameters") or {})
+    return page(run["name"], f"""<div class="wrap"><div class="top"><div><a href="/">← 实验总览</a><div class="page-eyebrow">Experiment detail</div><div class="brand" title="{html.escape(run['name'])}">{html.escape(display_code)}</div><div class="page-subtitle">{html.escape(display_subtitle or run['name'])}</div><div class="muted"><span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span></div></div><div class="top-actions">{clone_button}<a class="button secondary" href="/lineage">实验谱系</a><div id="statusBadge">{status_badge(run['status'])}</div><a class="button secondary" href="/logout">退出登录</a></div></div>
+    <div class="panel detail-hero"><div class="detail-kpis"><div class="detail-kpi"><div class="label">Epoch</div><div id="epochValue" class="value">{run['current_epoch']} / {total}</div></div><div class="detail-kpi"><div class="label">Best mAP50-95</div><div id="bestMapValue" class="value">{percentage(best_map)}</div></div><div class="detail-kpi"><div class="label">vs Baseline</div><div id="baselineDeltaValue" class="value">{baseline_delta_html(run, best_map)}</div></div><div class="detail-kpi"><div class="label">ETA</div><div id="etaValue" class="value">{human_duration(run.get('eta_seconds'))}</div></div></div><div class="bar"><div id="progressFill" class="fill" style="width:{pct:.1f}%"></div></div><div class="detail-meta"><span>Batch <strong id="batchValue">{run.get('current_batch') or '—'} / {run.get('total_batches') or '—'}</strong></span><span>已运行 <strong id="elapsedValue">{human_duration(run.get('elapsed_seconds'))}</strong></span><span id="environmentBrief">{html.escape(environment)}</span></div></div>
+    <div id="dynamicError" class="panel" style="display:{'block' if run.get('error_message') else 'none'}"><h3>错误信息</h3><pre id="dynamicErrorText">{html.escape(run.get('error_message') or '')}</pre></div>
+    <nav class="tab-list" role="tablist" aria-label="实验详情"><button class="tab-button" type="button" role="tab" data-tab="overview" aria-selected="true">总览</button><button class="tab-button" type="button" role="tab" data-tab="metrics" aria-selected="false">指标曲线</button><button class="tab-button" type="button" role="tab" data-tab="resources" aria-selected="false">资源监控</button><button class="tab-button" type="button" role="tab" data-tab="logs" aria-selected="false">日志</button><button class="tab-button" type="button" role="tab" data-tab="environment" aria-selected="false">配置环境</button><button class="tab-button" type="button" role="tab" data-tab="artifacts" aria-selected="false">产物</button><button class="tab-button" type="button" role="tab" data-tab="notes" aria-selected="false">实验记录</button></nav>
+    <section class="tab-panel" id="tab-overview" role="tabpanel"><div class="panel"><div class="metric-section"><h3>Performance</h3><div id="performanceMetrics">{performance_html(events, latest_metrics)}</div></div><div class="metric-section"><h3>Loss</h3><div id="lossMetrics">{losses_html(latest_metrics)}</div></div><div class="muted">最佳值来自各指标的历史 Epoch；上方大数字为最新/最终值。完整曲线和所有原始指标见「指标曲线」。</div></div></section>
+    <section class="tab-panel" id="tab-metrics" role="tabpanel" hidden>{chart}<div class="panel"><h3>最佳 Epoch</h3><div id="bestEpoch">{best_epoch_html(best)}</div><details><summary>查看全部最新/最终原始指标</summary><div id="latestMetrics">{metric_chips(latest_metrics)}</div></details></div></section>
+    <section class="tab-panel" id="tab-resources" role="tabpanel" hidden><div class="panel"><h3>GPU / 主机状态</h3><div id="hostStatus">{host_status_html(run.get('host_status') or {})}</div></div></section>
+    <section class="tab-panel" id="tab-logs" role="tabpanel" hidden><div class="panel"><h3>实时日志尾部</h3><div class="muted">SSE 实时更新；保留最近约 12,000 个字符。</div><pre id="logTail" class="log-tail">{log_text}</pre></div></section>
+    <section class="tab-panel" id="tab-environment" role="tabpanel" hidden><div class="panel"><details><summary><strong>可复现信息</strong> · {html.escape(environment)}</summary><div id="reproducibility">{reproducibility_html(run.get('parameters') or {})}</div></details></div>{lineage_panel}<div class="panel"><h3>相对基线的模型配置差异</h3><pre>{html.escape(summary.get('config_diff') or '设置基线 Run ID 且新旧实验都上传模型 YAML 后，将自动显示逐行差异。')}</pre></div></section>
+    <section class="tab-panel" id="tab-artifacts" role="tabpanel" hidden>{artifact_panel or '<div class="panel"><p class="muted">实验尚未上报输出目录。</p></div>'}<div class="panel"><h3>结果信息</h3><div id="resultMetrics">{metric_chips(run['result'])}</div></div></section>
+    <section class="tab-panel" id="tab-notes" role="tabpanel" hidden><div class="panel"><div class="panel-heading"><h3>实验记录与标签</h3><span class="summary-chip">核心记录完整度 <strong>{metadata_complete} / {len(metadata_fields)}</strong></span></div><form id="metadataForm" class="notes-grid"><label><span class="label">分组</span><input id="groupName" class="filter-input" maxlength="80" value="{html.escape(run.get('group_name') or '')}" placeholder="例如 DroneVehicle"></label><label><span class="label">标签（逗号分隔）</span><input id="tagsInput" class="filter-input" value="{html.escape(', '.join(run.get('tags') or []))}" placeholder="PaperLAF, FP32Safe, baseline"></label><label class="controls"><input id="favoriteInput" type="checkbox" {'checked' if run.get('favorite') else ''}>收藏</label><label><span class="label">Hypothesis · 实验假设</span><textarea id="hypothesis" class="filter-input" placeholder="为什么做这个实验？预期哪些指标会改善？">{html.escape(run.get('hypothesis') or '')}</textarea></label><label><span class="label">Modification · 修改内容</span><textarea id="changeNotes" class="filter-input" placeholder="与父实验相比只改了什么？">{html.escape(run.get('change_notes') or '')}</textarea></label><label><span class="label">Conclusion · 结论</span><textarea id="conclusion" class="filter-input" placeholder="训练结束后填写结论">{html.escape(run.get('conclusion') or '')}</textarea></label><label><span class="label">结果记录</span><textarea id="resultNotes" class="filter-input">{html.escape(run.get('result_notes') or '')}</textarea></label><label><span class="label">下一步</span><textarea id="nextStep" class="filter-input">{html.escape(run.get('next_step') or '')}</textarea></label><label><span class="label">基线 Run ID</span><input id="baselineRunId" class="filter-input" maxlength="80" value="{html.escape(run.get('baseline_run_id') or '')}" placeholder="仅对显式父实验自动绑定"></label><label><span class="label">管理员密码</span><input id="metadataPassword" class="filter-input" type="password" autocomplete="current-password" required></label><div class="controls wide"><button class="button" type="submit">保存实验记录</button><span id="metadataMessage" class="muted">系统只补空字段，不覆盖人工内容。</span></div></form></div>{ai_panel}
+    <details class="panel danger-zone"><summary>危险区域 · 删除实验记录</summary><div><p class="muted">删除将永久移除实验及全部指标。需要输入下面显示的实验编号和管理员密码。</p><form id="deleteRunForm" method="post" action="/runs/{quote(run['id'])}/delete"><label>输入 <strong>{html.escape(display_code)}</strong> 确认<br><input class="confirm-name" name="confirm_name" autocomplete="off" required></label><label>管理员密码<br><input type="password" name="password" autocomplete="current-password" required></label><button class="button danger" type="submit">永久删除</button></form></div></details></section>
     <script>
     (()=>{{const runId={json.dumps(run['id'])},duration=value=>{{if(value===null||value===undefined)return '—';let s=Math.max(0,Math.floor(Number(value)||0)),h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;return h?(h+'小时 '+m+'分'):(m?(m+'分 '+s+'秒'):(s+'秒'))}};
     const aiLabels={{not_requested:'尚未生成',running:'生成中',completed:'已生成',failed:'生成失败'}},emailLabels={{not_requested:'未要求发送',pending:'等待报告生成',sent:'已发送',skipped:'未发送',failed:'发送失败'}};
+    const tabs=[...document.querySelectorAll('.tab-button')];function activateTab(name){{if(!tabs.some(tab=>tab.dataset.tab===name))name='overview';for(const tab of tabs){{const selected=tab.dataset.tab===name;tab.setAttribute('aria-selected',String(selected));document.getElementById('tab-'+tab.dataset.tab).hidden=!selected}}if(name==='metrics')requestAnimationFrame(()=>window.dispatchEvent(new Event('resize')))}}
+    tabs.forEach(tab=>{{tab.setAttribute('aria-controls','tab-'+tab.dataset.tab);tab.addEventListener('click',()=>{{history.replaceState(null,'','#'+tab.dataset.tab);activateTab(tab.dataset.tab)}})}});window.addEventListener('hashchange',()=>activateTab(location.hash.slice(1)));activateTab(location.hash.slice(1)||'overview');
+    const deleteForm=document.getElementById('deleteRunForm'),expectedName={json.dumps(display_code, ensure_ascii=False)};deleteForm.addEventListener('submit',event=>{{if(deleteForm.elements.namedItem('confirm_name').value.trim()!==expectedName){{event.preventDefault();alert('请输入准确的实验编号：'+expectedName);return}}if(!confirm('确定永久删除 '+expectedName+' 吗？此操作无法恢复。'))event.preventDefault()}});
     const aiButton=document.getElementById('generateAi'),aiMessage=document.getElementById('aiMessage'),aiReport=document.getElementById('aiReport'),aiEmpty=document.getElementById('aiEmpty');let aiPollTimer=null;
     const updateAiUi=r=>{{const status=r.ai_status||'not_requested',emailStatus=r.ai_email_status||'not_requested';document.getElementById('aiStatusValue').textContent=aiLabels[status]||status;document.getElementById('aiModelsValue').textContent=(r.ai_models||[]).join('、')||'—';document.getElementById('aiRequestedAt').textContent=r.ai_requested_at?'　提交时间：'+r.ai_requested_at:'';document.getElementById('aiGeneratedAt').textContent=r.ai_generated_at?'　生成时间：'+r.ai_generated_at:'';document.getElementById('aiEmailStatus').textContent='邮件：'+(emailLabels[emailStatus]||emailStatus)+(r.ai_email_sent_at?'（'+r.ai_email_sent_at+'）':'');const error=r.ai_error||r.ai_email_error||'';aiMessage.textContent=error||(status==='running'?'服务器已受理，正在生成报告；刷新页面不会丢失此状态。':status==='completed'?'报告已生成。':'');const report=r.ai_report||'';aiReport.textContent=report;aiReport.style.display=report?'block':'none';aiEmpty.style.display=report?'none':'block';aiButton.disabled=status==='running';aiButton.textContent=status==='running'?'正在生成…':'生成结论并发送邮件';if(status==='running'&&!aiPollTimer)aiPollTimer=setInterval(pollAi,3000);if(status!=='running'&&aiPollTimer){{clearInterval(aiPollTimer);aiPollTimer=null}}}};
     const pollAi=async()=>{{try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/ai-status',{{headers:{{'X-Monitor-Request':'dashboard'}},cache:'no-store'}});if(response.ok)updateAiUi(await response.json())}}catch{{}}}};
-    const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText');const stream=new EventSource('/events/runs/'+encodeURIComponent(runId));stream.onopen=()=>{{dot.classList.remove('offline');liveText.textContent='实时连接正常'}};stream.onerror=()=>{{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'}};stream.onmessage=event=>{{const data=JSON.parse(event.data),r=data.run,f=data.fragments,total=r.total_epochs||0;document.getElementById('statusBadge').innerHTML=f.status;document.getElementById('epochValue').textContent=(r.current_epoch||0)+' / '+total;document.getElementById('batchValue').textContent=(r.current_batch??'—')+' / '+(r.total_batches??'—');document.getElementById('elapsedValue').textContent=duration(r.elapsed_seconds);document.getElementById('etaValue').textContent=duration(r.eta_seconds);document.getElementById('progressFill').style.width=(total?Math.min(100,100*(r.current_epoch||0)/total):0)+'%';document.getElementById('latestMetrics').innerHTML=f.metrics;document.getElementById('bestEpoch').innerHTML=f.best;document.getElementById('hostStatus').innerHTML=f.host;document.getElementById('resultMetrics').innerHTML=f.result;document.getElementById('reproducibility').innerHTML=f.reproducibility;document.getElementById('logTail').textContent=r.log_tail||'训练端尚未上报日志。';if(window.updateTrendSources)window.updateTrendSources([{{id:r.id,name:r.name,events:data.events}}]);const errorBox=document.getElementById('dynamicError');if(r.error_message){{errorBox.style.display='block';document.getElementById('dynamicErrorText').textContent=r.error_message}}else errorBox.style.display='none';if(document.activeElement!==document.getElementById('groupName'))document.getElementById('groupName').value=r.group_name||'';if(document.activeElement!==document.getElementById('tagsInput'))document.getElementById('tagsInput').value=(r.tags||[]).join(', ');document.getElementById('favoriteInput').checked=!!r.favorite;for(const [id,key] of [['hypothesis','hypothesis'],['changeNotes','change_notes'],['resultNotes','result_notes'],['conclusion','conclusion'],['nextStep','next_step'],['baselineRunId','baseline_run_id']]){{const field=document.getElementById(id);if(document.activeElement!==field)field.value=r[key]||''}}updateAiUi(r)}};
+    const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText');const stream=new EventSource('/events/runs/'+encodeURIComponent(runId));stream.onopen=()=>{{dot.classList.remove('offline');liveText.textContent='实时连接正常'}};stream.onerror=()=>{{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'}};stream.onmessage=event=>{{const data=JSON.parse(event.data),r=data.run,f=data.fragments,total=r.total_epochs||0;document.getElementById('statusBadge').innerHTML=f.status;document.getElementById('epochValue').textContent=(r.current_epoch||0)+' / '+total;document.getElementById('batchValue').textContent=(r.current_batch??'—')+' / '+(r.total_batches??'—');document.getElementById('elapsedValue').textContent=duration(r.elapsed_seconds);document.getElementById('etaValue').textContent=duration(r.eta_seconds);document.getElementById('bestMapValue').textContent=f.best_map;document.getElementById('baselineDeltaValue').innerHTML=f.baseline_delta;document.getElementById('performanceMetrics').innerHTML=f.performance;document.getElementById('lossMetrics').innerHTML=f.losses;document.getElementById('environmentBrief').textContent=f.environment_brief;document.getElementById('progressFill').style.width=(total?Math.min(100,100*(r.current_epoch||0)/total):0)+'%';document.getElementById('latestMetrics').innerHTML=f.metrics;document.getElementById('bestEpoch').innerHTML=f.best;document.getElementById('hostStatus').innerHTML=f.host;document.getElementById('resultMetrics').innerHTML=f.result;document.getElementById('reproducibility').innerHTML=f.reproducibility;document.getElementById('logTail').textContent=r.log_tail||'训练端尚未上报日志。';if(window.updateTrendSources)window.updateTrendSources([{{id:r.id,name:r.name,events:data.events}}]);const errorBox=document.getElementById('dynamicError');if(r.error_message){{errorBox.style.display='block';document.getElementById('dynamicErrorText').textContent=r.error_message}}else errorBox.style.display='none';if(document.activeElement!==document.getElementById('groupName'))document.getElementById('groupName').value=r.group_name||'';if(document.activeElement!==document.getElementById('tagsInput'))document.getElementById('tagsInput').value=(r.tags||[]).join(', ');document.getElementById('favoriteInput').checked=!!r.favorite;for(const [id,key] of [['hypothesis','hypothesis'],['changeNotes','change_notes'],['resultNotes','result_notes'],['conclusion','conclusion'],['nextStep','next_step'],['baselineRunId','baseline_run_id']]){{const field=document.getElementById(id);if(document.activeElement!==field)field.value=r[key]||''}}updateAiUi(r)}};
     const form=document.getElementById('metadataForm');form.addEventListener('submit',async event=>{{event.preventDefault();const message=document.getElementById('metadataMessage'),password=document.getElementById('metadataPassword');message.textContent='保存中…';const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/metadata',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{group_name:document.getElementById('groupName').value,tags:document.getElementById('tagsInput').value,favorite:document.getElementById('favoriteInput').checked,hypothesis:document.getElementById('hypothesis').value,change_notes:document.getElementById('changeNotes').value,result_notes:document.getElementById('resultNotes').value,conclusion:document.getElementById('conclusion').value,next_step:document.getElementById('nextStep').value,baseline_run_id:document.getElementById('baselineRunId').value,password:password.value}})}});password.value='';message.textContent=response.ok?'已保存':(response.status===403?'管理员密码错误':'保存失败')}})}})();
     const aiForm=document.getElementById('aiGenerateForm');aiForm.addEventListener('submit',async event=>{{event.preventDefault();const password=document.getElementById('aiPassword');if(!password.value)return;aiButton.disabled=true;aiButton.textContent='正在提交…';aiMessage.textContent='正在向服务器提交请求…';const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),20000);try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/ai-generate',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{password:password.value,send_email:true}}),signal:controller.signal}});let result={{}};try{{result=await response.json()}}catch{{}}password.value='';if(response.ok){{updateAiUi(result);aiMessage.textContent='服务器已确认提交，正在生成报告；刷新页面不会丢失此状态。';await pollAi()}}else{{aiButton.disabled=false;aiButton.textContent='生成结论并发送邮件';aiMessage.textContent=result.error||(response.status===403?'管理员密码错误':'提交失败')}}}}catch(error){{aiButton.disabled=false;aiButton.textContent='生成结论并发送邮件';aiMessage.textContent=error.name==='AbortError'?'提交超时，服务器尚未确认，请稍后重试。':'网络错误，服务器未确认提交。'}}finally{{clearTimeout(timeout)}}}});pollAi();
     </script></div>""")
@@ -3104,7 +3402,7 @@ def ai_settings_html() -> str:
 
 def login_html(error: str = "") -> str:
     err = f'<p style="color:var(--red)">{html.escape(error)}</p>' if error else ""
-    return page("登录", f"""<div class="wrap login"><div class="panel"><div class="brand">YOLO 实验监控</div><p class="muted">请输入管理密码</p>{err}<form method="post" action="/login"><input type="password" name="password" autofocus required><button class="button" type="submit">登录</button></form></div></div>""")
+    return page("登录", f"""<div class="wrap login"><div class="panel"><div class="page-eyebrow">Research workspace</div><div class="brand">MCONG Lab</div><p class="muted">请输入管理密码</p>{err}<form method="post" action="/login"><input type="password" name="password" autofocus required><button class="button" type="submit">登录</button></form></div></div>""")
 
 
 def make_session() -> str:
@@ -3203,10 +3501,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         last_payload = b""
         last_heartbeat = 0.0
+        last_dashboard_scan = 0.0
         try:
             for _ in range(300):
                 if kind == "dashboard":
-                    data = {"runs": [dashboard_run(run) for run in STORE.list_runs()]}
+                    if time.monotonic() - last_dashboard_scan < 10:
+                        time.sleep(2)
+                        continue
+                    data = dashboard_payload()
+                    last_dashboard_scan = time.monotonic()
                 else:
                     run = STORE.get_run(run_id)
                     if not run:
@@ -3368,6 +3671,9 @@ class Handler(BaseHTTPRequestHandler):
             clone_runs = query.get("clone_run", [])
             clone_job = STORE.get_queue_job(clone_values[0], True) if clone_values else (STORE.get_queue_job_by_run(clone_runs[0], True) if clone_runs else None)
             self.send_html(200, queue_html(STORE.list_queue_jobs_with_reasons(False), STORE.list_agents(), clone_job))
+            return
+        if path == "/lineage":
+            self.send_html(200, lineage_html(STORE.list_runs(limit=1000)))
             return
         if path.startswith("/queue/jobs/"):
             job_id = unquote(path[len("/queue/jobs/") :].strip("/"))
@@ -3611,8 +3917,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 form = parse_qs(self.read_body(10000).decode())
                 password = form.get("password", [""])[0]
+                confirmation = form.get("confirm_name", [""])[0].strip()
             except (UnicodeDecodeError, ValueError):
                 password = ""
+                confirmation = ""
             if not CFG.admin_password or not hmac.compare_digest(password, CFG.admin_password):
                 self.send_html(
                     HTTPStatus.FORBIDDEN,
@@ -3620,6 +3928,13 @@ class Handler(BaseHTTPRequestHandler):
                         "删除失败",
                         f'<div class="wrap"><div class="panel"><h2>删除失败</h2><p>管理员密码错误，实验记录未删除。</p><a href="/runs/{quote(run_id)}">返回实验详情</a></div></div>',
                     ),
+                )
+                return
+            target = STORE.get_run(run_id)
+            if target and confirmation != experiment_display_name(target["name"])[0]:
+                self.send_html(
+                    HTTPStatus.BAD_REQUEST,
+                    page("删除失败", f'<div class="wrap"><div class="panel"><h2>删除失败</h2><p>实验编号确认不匹配，记录未删除。</p><a href="/runs/{quote(run_id)}">返回实验详情</a></div></div>'),
                 )
                 return
             if STORE.delete_run(run_id):
