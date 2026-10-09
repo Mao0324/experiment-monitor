@@ -25,7 +25,7 @@
 - systemd 开机启动、故障重启和安全限制；
 - 上报失败不会中断 YOLO 训练。
 - 自动 DDP 使用共享 run ID，并且只有 Rank 0 上报，避免双卡产生重复实验。
-- Agent 自动扫描允许目录中的 `train_dronevehicle*.py` 并在网页选择脚本后自动填表；
+- Agent 按 `script_scan_patterns` 自动扫描允许目录中的训练脚本，并在网页选择脚本后自动填表；默认包含 `train_dronevehicle*.py` 和 `train_flir*.py`；
 - 新任务先做不占 GPU 的 Python、路径、checkpoint、数据配置、磁盘和依赖预检；
 - 队列逐项解释未启动原因，包括缺少 GPU 数、显存不足、利用率超限和剩余空闲时间；
 - 可复制历史队列任务或基于由队列启动的实验新建，并可按“脚本 × batch”批量生成消融任务；
