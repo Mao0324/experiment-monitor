@@ -982,6 +982,21 @@ class Agent:
             try: os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError: pass
 
+    def recovery_heartbeat(self) -> dict | None:
+        try:
+            return self.heartbeat(self.gpu_status())
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+            # The server has discarded a lease whose process is already gone.
+            print(
+                f"[queue agent] dead recovered job {self.current_job.get('id')} is absent on server; "
+                "releasing local slot",
+                flush=True,
+            )
+            self.clear_runtime()
+            return None
+
     def run_forever(self):
         print(f"[queue agent] {self.agent_id} connected to {self.server}", flush=True)
         while not self.stop_requested:
@@ -990,7 +1005,9 @@ class Agent:
                     if self.current_pid and self.process_matches(self.current_pid, str(self.current_job.get("id"))):
                         self.monitor_current_process()
                         continue
-                    response = self.heartbeat(self.gpu_status())
+                    response = self.recovery_heartbeat()
+                    if response is None:
+                        continue
                     server_job = response.get("current_job") or {}
                     if not server_job:
                         print(f"[queue agent] recovered job {self.current_job.get('id')} is absent on server; releasing local slot", flush=True)
@@ -1004,7 +1021,10 @@ class Agent:
                         except (OSError, ValueError) as exc:
                             print(f"[queue agent] recovery verification unavailable: {exc}", flush=True)
                         else:
-                            server_job = (self.heartbeat(self.gpu_status()).get("current_job") or server_job)
+                            refreshed = self.recovery_heartbeat()
+                            if refreshed is None:
+                                continue
+                            server_job = refreshed.get("current_job") or server_job
                     if server_job.get("run_verified_complete"):
                         if server_job.get("status") != "completed":
                             self.update_job(self.current_job, "completed", message="Run completion verified during Agent recovery",

@@ -214,6 +214,27 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(update.call_args.args[1], "completed")
         anomaly.assert_not_called()
 
+    def test_agent_recovery_releases_deleted_server_lease(self):
+        spec = importlib.util.spec_from_file_location("queue_deleted_lease_test", AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        agent = module.Agent({"server_url": "https://example.test", "api_token": "x",
+                              "allowed_roots": [self.temp.name], "log_directory": self.temp.name})
+        agent.current_job = {"id": "deleted-job", "name": "test"}
+
+        def stop_after_clear():
+            agent.stop_requested = True
+
+        missing = module.HTTPError("https://example.test/heartbeat", 404, "Not Found", {}, None)
+        with patch.object(agent, "gpu_status", return_value=[]), \
+             patch.object(agent, "heartbeat", side_effect=missing), \
+             patch.object(agent, "clear_runtime", side_effect=stop_after_clear) as clear, \
+             patch.object(agent, "finish_process") as finish, \
+             patch.object(module.time, "sleep"):
+            agent.run_forever()
+        clear.assert_called_once()
+        finish.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
