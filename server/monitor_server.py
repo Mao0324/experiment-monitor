@@ -3317,9 +3317,11 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         let matches=[],active=-1;
         function closeResults(){results.hidden=true;search.setAttribute('aria-expanded','false');search.removeAttribute('aria-activedescendant');active=-1}
         function clearBinding(){
+          const wasBound=Boolean(selector.value);
           selector.value='';
           form.elements.namedItem('script_id').value='';
           form.elements.namedItem('script_path').value='';
+          if(wasBound)form.elements.namedItem('baseline_run_id').value='';
           document.getElementById('lineageInfo').hidden=true;
           document.getElementById('scriptInfo').textContent='未绑定扫描脚本；可手动修改任务名称、工作目录和启动命令。';
         }
@@ -3377,6 +3379,13 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         });
         document.addEventListener('pointerdown',event=>{if(!picker.contains(event.target))closeResults()});
         document.getElementById('scriptManual').addEventListener('click',()=>{search.value='';clearBinding();closeResults();form.elements.namedItem('name').focus()});
+        form.addEventListener('submit',event=>{
+          if(search.value.trim()&&!selector.value){
+            event.preventDefault();event.stopImmediatePropagation();
+            document.getElementById('queueMessage').textContent='请先从搜索结果选择脚本，或点击“手动填写”。';
+            disclosure.open=true;search.focus();
+          }
+        },true);
         const selected=scripts.find(item=>item.option.value===selector.value);
         if(selected)search.value=selected.name;
       });
