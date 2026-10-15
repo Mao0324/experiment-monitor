@@ -2570,6 +2570,10 @@ table{table-layout:auto}th,td{border-bottom:1px solid var(--line)}tr:last-child 
 @media(max-width:440px){.summary-grid,.metric-feature-grid,.loss-grid,.notes-grid{grid-template-columns:1fr}.detail-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.summary-card .summary-value{font-size:25px}}
 """
 
+STYLE += """
+.queue-view-bar,.queue-filter-bar,.script-picker-control{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.queue-view-bar{margin:2px 0 16px}.queue-view-button{border:1px solid var(--line);background:var(--panel-soft);color:var(--muted);border-radius:10px;padding:8px 13px;font:inherit;cursor:pointer}.queue-view-button[aria-pressed=true]{background:var(--button);border-color:var(--button);color:var(--button-text);font-weight:700}.queue-filter-bar{align-items:end;margin-bottom:14px}.queue-filter-bar label{display:grid;gap:5px;color:var(--muted);font-size:12px}.queue-filter-bar input{min-width:min(310px,75vw)}.queue-filter-bar .queue-filter-count{margin-left:auto;color:var(--muted);font-size:12px}.queue-row[hidden],.queue-empty[hidden]{display:none}.queue-create-disclosure{padding:0;overflow:visible}.queue-create-disclosure>.queue-create-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:20px 22px;list-style:none;color:var(--text);font-size:inherit;cursor:pointer}.queue-create-summary::-webkit-details-marker{display:none}.queue-create-summary h3{margin:0}.queue-create-summary .muted{margin-top:3px}.queue-create-summary-side{display:flex;align-items:center;gap:12px;flex-shrink:0}.queue-create-disclosure[open]>.queue-create-summary{border-bottom:1px solid var(--line)}.queue-create-disclosure[open] .agent-chevron{transform:rotate(225deg);margin:4px 4px 0 2px}.queue-create-body{padding:20px 22px 22px}.script-picker{min-width:0}.script-picker>label{display:block;margin-bottom:5px}.script-search-wrap{position:relative;flex:1;min-width:min(250px,100%)}.script-search-wrap>input{width:100%}.script-picker-control>.button{white-space:nowrap}.script-search-results{position:absolute;z-index:20;top:calc(100% + 6px);left:0;right:0;max-height:min(430px,60vh);overflow:auto;padding:5px;background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}.script-search-results[hidden]{display:none}.script-result{display:block;width:100%;padding:9px 10px;text-align:left;border:0;border-radius:8px;background:transparent;color:var(--text);font:inherit;cursor:pointer}.script-result:hover,.script-result.is-active{background:var(--panel-soft)}.script-result-main{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:650}.script-result-sub,.script-search-hint{display:block;color:var(--muted);font-size:12px}.script-search-hint{padding:8px 10px}.script-picker-help{margin-top:6px;font-size:12px}.script-picker select[hidden]{display:none}@media(max-width:700px){.queue-create-disclosure>.queue-create-summary{padding:16px}.queue-create-body{padding:16px}.queue-create-summary-side .summary-chip{display:none}.queue-filter-bar label{width:100%}.queue-filter-bar input,.queue-filter-bar select{width:100%}.queue-filter-bar .queue-filter-count{margin-left:0;width:100%}}
+"""
+
 
 def page(title: str, body: str, refresh: int | None = None) -> str:
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
@@ -3143,8 +3147,10 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             if job.get("fault_suggestion") and status in {"failed", "cancelled", "paused", "waiting_memory"}
             else ""
         )
+        view = "history" if status in {"completed", "failed", "cancelled"} else "current"
+        initial_hidden = " hidden" if view == "history" else ""
         job_rows.append(
-            f'''<tr class="queue-row queue-{html.escape(status)}">
+            f'''<tr class="queue-row queue-{html.escape(status)}" data-view="{view}" data-status="{html.escape(status, quote=True)}" data-name="{html.escape(str(job['name']), quote=True)}" data-id="{html.escape(str(job['id']), quote=True)}"{initial_hidden}>
             <td>{task_title}<br><span class="label">{html.escape(job['id'][:12])}</span>{cancelled_note}{output_binding}<div class="queue-actions">{''.join(actions)}</div></td>
             <td><span class="queue-status status-{html.escape(status)}">{html.escape(status_text)}</span></td>
             <td>{job['priority']}</td>
@@ -3155,7 +3161,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             <td>{html.escape(policy_labels.get(job['anomaly_policy'], job['anomaly_policy']))}</td>
             </tr>'''
         )
-    job_rows_html = "".join(job_rows) or '<tr><td colspan="8" class="empty">队列为空</td></tr>'
+    job_rows_html = "".join(job_rows)
 
     def number(value, default=0.0):
         try:
@@ -3202,7 +3208,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         agent_cards.append(f'''<section class="agent-card"><div class="agent-heading"><div><h4>{html.escape(str(agent.get('hostname') or agent.get('id') or '未知主机'))}</h4><div class="agent-meta"><span class="label">Worker Slot · {html.escape(str(agent.get('id') or ''))}</span>{current_job_html}</div></div><div><span class="agent-state {'running' if state == 'running' else ''}">{html.escape(agent_state_labels.get(state, state))}</span><div class="label" style="margin-top:5px">心跳 {html.escape(str(agent.get('updated_at') or '—'))}</div></div></div><div class="gpu-grid">{''.join(gpu_cards)}</div></section>''')
 
     queue_counts = {
-        "active": sum(1 for job in jobs if job.get("status") in cancellable),
+        "active": sum(1 for job in jobs if job.get("status") not in {"completed", "failed", "cancelled"}),
         "completed": sum(1 for job in jobs if job.get("status") == "completed"),
         "cancelled": sum(1 for job in jobs if job.get("status") == "cancelled"),
         "failed": sum(1 for job in jobs if job.get("status") == "failed"),
@@ -3227,9 +3233,14 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         str(agent.get("hostname") or agent.get("id") or "").strip().casefold()
         for agent in agents if agent.get("hostname") or agent.get("id")
     })
-    template = '''<div class="wrap"><div class="top"><div><a href="/">← 全部实验</a><div class="brand">实验队列与训练 Agent</div><div class="muted">页面已启用登录保护；高风险操作仍需再次输入管理员密码。</div></div><div class="top-actions"><a class="button secondary" href="/downloads/yolo-queue-agent.zip">下载 Linux Agent</a><a class="button secondary" href="/logout">退出登录</a></div></div>
-    <div id="new-job" class="panel"><div class="panel-heading"><div><h3>__FORM_TITLE__</h3><div class="muted">选择 Agent 扫描到的训练脚本可自动填表；提交后先做无 GPU 预检，通过后才会领取。</div></div><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span></div>
-    <form id="queueForm" class="grid queue-edit-form"><label class="form-wide">训练脚本选择器<select id="scriptSelector" class="filter-input"><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></label>
+    catalog_host_count = len({str(item.get("hostname") or "").strip().casefold() for item in catalogs})
+    template = '''<div class="wrap"><div class="top"><div><a href="/">← 全部实验</a><div class="brand">实验队列与训练 Agent</div><div class="muted">页面已启用登录保护；高风险操作仍需再次输入管理员密码。</div></div><div class="top-actions"><a class="button" href="#new-job">新增任务</a><a class="button secondary" href="/downloads/yolo-queue-agent.zip">下载 Linux Agent</a><a class="button secondary" href="/logout">退出登录</a></div></div>
+    <div class="panel"><div class="panel-heading"><div><h3>队列</h3><div class="muted">先看正在运行与等待中的任务；历史任务可切换查看。</div></div><div class="queue-summary">__QUEUE_SUMMARY__</div></div>
+    <div class="queue-view-bar" aria-label="队列视图"><button type="button" class="queue-view-button" data-view="current" aria-pressed="true">当前任务 <span>__ACTIVE_COUNT__</span></button><button type="button" class="queue-view-button" data-view="history" aria-pressed="false">历史任务 <span>__HISTORY_COUNT__</span></button></div>
+    <div class="queue-filter-bar"><label for="queueSearch">搜索任务名<input id="queueSearch" class="filter-input" type="search" placeholder="输入任务名或任务 ID" autocomplete="off"></label><label for="queueStatusFilter">状态筛选<select id="queueStatusFilter" class="filter-input"></select></label><span id="queueFilterCount" class="queue-filter-count" aria-live="polite"></span></div>
+    <div class="table-scroll"><table class="queue-table"><thead><tr><th>任务 / 操作</th><th>状态</th><th>优先级</th><th>GPU</th><th>预检</th><th>未启动原因 / 建议</th><th>尝试</th><th>异常策略</th></tr></thead><tbody>__JOB_ROWS__<tr id="queueEmpty" class="queue-empty" hidden><td colspan="8" class="empty">当前视图暂无任务</td></tr></tbody></table></div></div>
+    <details id="new-job" class="panel queue-create-disclosure"__FORM_OPEN__><summary class="queue-create-summary"><div><h3>__FORM_TITLE__</h3><div class="muted">选择训练脚本自动填表；提交前先做无 GPU 预检。</div></div><div class="queue-create-summary-side"><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="queue-create-body">
+    <form id="queueForm" class="grid queue-edit-form"><div class="form-wide script-picker" data-host-count="__CATALOG_HOST_COUNT__"><label for="scriptSearch">训练脚本选择器</label><div class="script-picker-control"><div class="script-search-wrap"><input id="scriptSearch" class="filter-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="scriptResults" placeholder="搜索 CPD004、flir 或脚本文件名" autocomplete="off"><div id="scriptResults" class="script-search-results" role="listbox" hidden></div></div><button id="scriptManual" class="button secondary" type="button">手动填写</button></div><div class="script-picker-help muted">输入关键词实时筛选，最多显示 10 条；也可以直接填写下方字段。</div><select id="scriptSelector" hidden><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></div>
     <div id="scriptInfo" class="script-info form-wide muted">Agent 上线并完成扫描后，这里会显示脚本内置 checkpoint、数据配置和默认 GPU。</div>
     <div id="lineageInfo" class="script-info form-wide" hidden></div>
     <input name="script_id" type="hidden"><input name="script_path" type="hidden"><input name="source_job_id" type="hidden">
@@ -3245,12 +3256,134 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     <label class="form-wide">任务备注<textarea name="notes" class="filter-input"></textarea></label>
     <div class="queue-mode-row form-wide"><label>任务创建方式<select id="queueMode" class="filter-input"><option value="single">单个队列任务</option><option value="sweep">批量消融 / 参数扫描</option></select></label><span class="muted">选择批量模式后，参数组合会在下方展开。</span></div>
     <div id="sweepFields" class="sweep-box form-wide" hidden><div class="panel-heading"><div><strong>批量消融 / 参数扫描</strong><div class="muted">选择多个脚本和 batch，自动生成实验组合。</div></div><span class="summary-chip">最多 50 条</span></div><div class="grid"><label>batch 组合<input id="sweepBatches" class="filter-input" placeholder="64,32,16"></label><label class="form-wide">脚本组合（Ctrl / Shift 多选）<select id="sweepScripts" class="filter-input" multiple size="5">__CATALOG_OPTIONS__</select></label><div class="muted form-wide">将按“脚本 × batch”生成任务；模型/配置组合请用不同训练脚本表示。</div></div></div>
-    <div class="form-wide controls"><button class="button" type="submit">预检并加入队列</button><span id="queueMessage" class="muted"></span></div></form></div>
+    <div class="form-wide controls"><button class="button" type="submit">预检并加入队列</button><span id="queueMessage" class="muted"></span></div></form></div></details>
     <details class="panel agent-disclosure"><summary class="agent-summary"><div class="agent-summary-copy"><div class="agent-summary-title"><h3>训练 Agent</h3><span class="agent-toggle-text" aria-hidden="true"></span></div><div class="muted">一台物理主机可运行多个 Worker Slot；点击查看各显卡实时占用。</div></div><div class="agent-summary-side"><span class="summary-chip">在线主机 <strong>__HOST_COUNT__</strong> · Worker Slot <strong>__SLOT_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="agent-disclosure-body"><div class="agent-list">__AGENT_CARDS__</div></div></details>
-    <div class="panel"><div class="panel-heading"><div><h3>队列</h3><div class="muted">等待原因会精确列出缺卡、显存、利用率和剩余空闲秒数。</div></div><div class="queue-summary">__QUEUE_SUMMARY__</div></div><div class="table-scroll"><table class="queue-table"><thead><tr><th>任务 / 操作</th><th>状态</th><th>优先级</th><th>GPU</th><th>预检</th><th>未启动原因 / 建议</th><th>尝试</th><th>异常策略</th></tr></thead><tbody>__JOB_ROWS__</tbody></table></div></div>
+    <script>(()=>{
+      document.addEventListener('DOMContentLoaded',()=>{
+        const fold=value=>String(value||'').normalize('NFKC').toLowerCase().replace(/[\\s_.-]+/g,'');
+        const rows=Array.from(document.querySelectorAll('.queue-row'));
+        const viewButtons=Array.from(document.querySelectorAll('.queue-view-button'));
+        const queueSearch=document.getElementById('queueSearch');
+        const statusFilter=document.getElementById('queueStatusFilter');
+        const filterCount=document.getElementById('queueFilterCount');
+        const emptyRow=document.getElementById('queueEmpty');
+        const statusChoices={
+          current:[['','全部当前状态'],['running','运行中'],['leased','已领取'],['queued','排队中'],['waiting_memory','等待显存'],['paused','已暂停']],
+          history:[['','全部历史状态'],['completed','已完成'],['failed','失败'],['cancelled','已取消']]
+        };
+        let currentView='current';
+        function filterQueue(){
+          const query=fold(queueSearch.value),status=statusFilter.value;
+          let shown=0,total=0;
+          for(const row of rows){
+            const inView=row.dataset.view===currentView;
+            if(inView)total++;
+            const matches=inView&&(!status||row.dataset.status===status)&&(!query||fold(row.dataset.name+' '+row.dataset.id).includes(query));
+            row.hidden=!matches;
+            if(matches)shown++;
+          }
+          emptyRow.hidden=shown>0;
+          emptyRow.cells[0].textContent=query?'没有匹配的任务':status?'该状态暂无任务':currentView==='current'?'暂无当前任务':'暂无历史任务';
+          filterCount.textContent='显示 '+shown+' / '+total+' 条';
+        }
+        function setView(view){
+          currentView=view;
+          for(const button of viewButtons)button.setAttribute('aria-pressed',String(button.dataset.view===view));
+          statusFilter.replaceChildren(...statusChoices[view].map(([value,label])=>new Option(label,value)));
+          filterQueue();
+        }
+        for(const button of viewButtons)button.addEventListener('click',()=>setView(button.dataset.view));
+        queueSearch.addEventListener('input',filterQueue);
+        statusFilter.addEventListener('change',filterQueue);
+        setView('current');
+
+        const disclosure=document.getElementById('new-job');
+        const openForm=()=>{if(location.hash==='#new-job')disclosure.open=true};
+        openForm();
+        window.addEventListener('hashchange',openForm);
+        document.querySelector('.top-actions a[href="#new-job"]').addEventListener('click',()=>{disclosure.open=true});
+
+        const picker=document.querySelector('.script-picker');
+        const search=document.getElementById('scriptSearch');
+        const results=document.getElementById('scriptResults');
+        const selector=document.getElementById('scriptSelector');
+        const form=document.getElementById('queueForm');
+        const showHost=Number(picker.dataset.hostCount)>1;
+        const scripts=Array.from(selector.options).slice(1).map((option,index)=>{
+          const text=option.textContent||'';
+          const separator=text.indexOf(' · ');
+          return {option,index,name:separator<0?text:text.slice(separator+3),host:separator<0?'':text.slice(0,separator)};
+        });
+        let matches=[],active=-1;
+        function closeResults(){results.hidden=true;search.setAttribute('aria-expanded','false');search.removeAttribute('aria-activedescendant');active=-1}
+        function clearBinding(){
+          selector.value='';
+          form.elements.namedItem('script_id').value='';
+          form.elements.namedItem('script_path').value='';
+          document.getElementById('lineageInfo').hidden=true;
+          document.getElementById('scriptInfo').textContent='未绑定扫描脚本；可手动修改任务名称、工作目录和启动命令。';
+        }
+        function choose(item){
+          selector.value=item.option.value;
+          selector.dispatchEvent(new Event('change',{bubbles:true}));
+          search.value=item.name;
+          closeResults();
+          search.focus();
+        }
+        function markActive(index){
+          const options=Array.from(results.querySelectorAll('[role="option"]'));
+          if(!options.length)return;
+          active=(index+options.length)%options.length;
+          for(const [i,option] of options.entries()){
+            option.classList.toggle('is-active',i===active);
+            option.setAttribute('aria-selected',String(i===active));
+          }
+          search.setAttribute('aria-activedescendant',options[active].id);
+          options[active].scrollIntoView({block:'nearest'});
+        }
+        function showResults(){
+          const query=fold(search.value);
+          const found=scripts.filter(item=>fold(item.name+' '+item.host).includes(query));
+          matches=found.slice(0,10);
+          active=-1;
+          search.removeAttribute('aria-activedescendant');
+          results.replaceChildren();
+          for(const [index,item] of matches.entries()){
+            const button=document.createElement('button');
+            button.type='button';button.id='scriptOption'+index;button.className='script-result';button.setAttribute('role','option');button.setAttribute('aria-selected','false');
+            const name=document.createElement('span');name.className='script-result-main';name.textContent=item.name;button.append(name);
+            if(showHost){const host=document.createElement('span');host.className='script-result-sub';host.textContent=item.host;button.append(host)}
+            button.addEventListener('mousedown',event=>event.preventDefault());
+            button.addEventListener('click',()=>choose(item));
+            results.append(button);
+          }
+          const hint=document.createElement('div');hint.className='script-search-hint';
+          hint.textContent=found.length?('显示前 '+matches.length+' 条 / 共 '+found.length+' 条；继续输入可缩小范围'):(scripts.length?'没有匹配的脚本':'Agent 尚未发现脚本，请手动填写');
+          results.append(hint);
+          results.hidden=false;
+          search.setAttribute('aria-expanded','true');
+        }
+        search.addEventListener('focus',showResults);
+        search.addEventListener('input',()=>{clearBinding();showResults()});
+        search.addEventListener('keydown',event=>{
+          if(event.key==='Escape'){closeResults();return}
+          if(event.key==='ArrowDown'||event.key==='ArrowUp'){
+            event.preventDefault();if(results.hidden)showResults();
+            markActive(active<0?(event.key==='ArrowDown'?0:matches.length-1):active+(event.key==='ArrowDown'?1:-1));
+          }else if(event.key==='Enter'&&!results.hidden){
+            event.preventDefault();
+            if(active>=0)choose(matches[active]);else if(matches.length===1)choose(matches[0]);
+          }
+        });
+        document.addEventListener('pointerdown',event=>{if(!picker.contains(event.target))closeResults()});
+        document.getElementById('scriptManual').addEventListener('click',()=>{search.value='';clearBinding();closeResults();form.elements.namedItem('name').focus()});
+        const selected=scripts.find(item=>item.option.value===selector.value);
+        if(selected)search.value=selected.name;
+      });
+    })();</script>
     <script>(()=>{const catalogs=__CATALOG_JSON__,initial=__INITIAL_JSON__,form=document.getElementById('queueForm'),selector=document.getElementById('scriptSelector'),message=document.getElementById('queueMessage'),policy=document.getElementById('queuePolicy'),batch=document.getElementById('queueBatch'),batchHint=document.getElementById('queueBatchHint'),queueMode=document.getElementById('queueMode'),sweepFields=document.getElementById('sweepFields'),sweepScripts=document.getElementById('sweepScripts'),lineageInfo=document.getElementById('lineageInfo');const field=n=>form.elements.namedItem(n),isSweep=()=>queueMode.value==='sweep';function showLineage(item){if(!item||!item.father_yaml_name){lineageInfo.hidden=true;lineageInfo.replaceChildren();return}lineageInfo.hidden=false;lineageInfo.replaceChildren();const title=document.createElement('strong');title.textContent='YAML 继承关系';lineageInfo.append(title,document.createElement('br'),document.createTextNode((item.model_yaml_name||'当前 YAML')+' → '+item.father_yaml_name),document.createElement('br'));const status=document.createElement('span');status.className='label';status.textContent=item.lineage_status==='matched'?'已精确匹配父 Run：'+item.father_run_name+'（'+item.father_run_id+'）':item.lineage_status==='run_missing'?'已识别父脚本，但监控库中暂未找到同名父 Run':item.lineage_status==='parent_script_missing'?'已识别父 YAML，但 Agent 目录中暂未找到对应父脚本':item.lineage_status==='reference_only'?'YAML 注释为“对照”，仅展示且不自动绑定':'父实验关系待解析';lineageInfo.append(status);if(item.change_summary){lineageInfo.append(document.createElement('br'),document.createTextNode('修改内容：'+item.change_summary))}}function applyScript(item,preserveName=false){if(!item)return;field('script_id').value=item.id||'';field('script_path').value=item.path||'';field('working_directory').value=item.working_directory||'';field('command').value=item.command||'';if(!preserveName)field('name').value=item.task_name||item.name||'';if(!preserveName||!field('baseline_run_id').value)field('baseline_run_id').value=item.father_run_id||'';if(item.default_batch)batch.value=item.default_batch;if(item.default_gpu_count)field('required_gpu_count').value=item.default_gpu_count;document.getElementById('scriptInfo').textContent='Python：'+(item.python||'—')+'　内置 checkpoint：'+(item.checkpoint||'未识别')+'　数据：'+((item.data_files||[]).join(', ')||'未识别')+'　默认 GPU：'+(item.default_device||'未识别');showLineage(item)}selector.addEventListener('change',()=>applyScript(catalogs.find(x=>x.id===selector.value)));function setInitial(){for(const [key,value] of Object.entries(initial)){const target=field(key);if(target&&value!==null&&value!==undefined){target.value=Array.isArray(value)?value.join(','):value}}if(initial.script_id){selector.value=initial.script_id;applyScript(catalogs.find(x=>x.id===initial.script_id),true)}if(initial.anomaly_policy)policy.value=initial.anomaly_policy}function syncBatchRequirement(){const required=policy.value==='retry_lower_batch';batch.required=required&&!isSweep();batch.placeholder=required?'必填，例如 64':'可留空';batchHint.textContent=required?'必填':'可留空'}function syncQueueMode(){sweepFields.hidden=!isSweep();syncBatchRequirement()}policy.addEventListener('change',syncBatchRequirement);queueMode.addEventListener('change',syncQueueMode);setInitial();syncQueueMode();form.addEventListener('submit',async e=>{e.preventDefault();syncBatchRequirement();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form).entries());if(isSweep()){const batches=document.getElementById('sweepBatches').value.replace(/，/g,',').split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);const scripts=Array.from(sweepScripts.selectedOptions).map(option=>catalogs.find(x=>x.id===option.value)).filter(Boolean);if(!batches.length||!scripts.length){message.textContent='批量扫描必须选择至少一个脚本并填写 batch 组合';return}data.sweep_jobs=[];for(const script of scripts)for(const value of batches)data.sweep_jobs.push({name:(script.task_name||script.name)+'-b'+value,working_directory:script.working_directory,command:script.command,script_id:script.id,script_path:script.path,batch_size:value,required_gpu_count:script.default_gpu_count||data.required_gpu_count,baseline_run_id:script.father_run_id||''});if(data.sweep_jobs.length>50){message.textContent='组合超过 50 条，请缩小范围';return}}message.textContent='正在创建并等待 Agent 预检…';const response=await fetch('/api/v1/web/queue',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(data)});let result={};try{result=await response.json()}catch{}message.textContent=response.ok?'已创建，预检结果将在队列表显示':(response.status===403?'管理员密码错误':result.error||'提交失败');if(response.ok)setTimeout(()=>location.href='/queue',700)});document.querySelectorAll('.queue-action').forEach(button=>button.addEventListener('click',async()=>{const action=button.dataset.action,labels={pause:'完成当前 Epoch 后暂停',resume:'从 checkpoint 恢复',cancel:'取消任务',requeue:'重新排队',requeue_resume:'从 checkpoint 续训',delete:'删除队列记录'};if(action==='delete'&&!confirm('仅删除这条符合条件的队列记录。实验结果、checkpoint 和训练文件不会被删除。确定继续吗？'))return;const password=prompt('请输入管理员密码以'+(labels[action]||'执行操作')+'：');if(password===null)return;const suffix=action==='delete'?'/delete':'/action';const body=action==='delete'?{password}:{password,action};const response=await fetch('/api/v1/web/queue/'+encodeURIComponent(button.dataset.id)+suffix,{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(body)});if(response.ok)location.reload();else{let result={};try{result=await response.json()}catch{}alert(response.status===403?'管理员密码错误':result.error||'操作失败')}}))})();</script></div>'''
     summary = f'<span class="summary-chip">待处理 <strong>{queue_counts["active"]}</strong></span><span class="summary-chip">已完成 <strong>{queue_counts["completed"]}</strong></span><span class="summary-chip">失败 <strong>{queue_counts["failed"]}</strong></span><span class="summary-chip cancelled">已取消 <strong>{queue_counts["cancelled"]}</strong></span>'
-    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
+    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
 
 
 def queue_job_html(job: dict) -> str:
