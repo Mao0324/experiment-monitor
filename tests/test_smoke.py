@@ -578,11 +578,18 @@ class SmokeTest(unittest.TestCase):
                     "catalog": catalog,
                 },
             )
-        with urlopen(self.base + "/queue", timeout=2) as response:
+        jar = http.cookiejar.CookieJar()
+        opener = build_opener(HTTPCookieProcessor(jar))
+        login = Request(self.base + "/login",
+                        data=urlencode({"password": "test-password"}).encode(),
+                        method="POST")
+        with opener.open(login, timeout=2):
+            pass
+        with opener.open(self.base + "/queue", timeout=2) as response:
             page_text = response.read().decode("utf-8")
         # One option in the normal selector and one in the batch selector,
         # rather than one copy per worker slot in both selectors.
-        self.assertEqual(page_text.count('<option value="slot-dedup-script">'), 2)
+        self.assertEqual(page_text.count('<option value="slot-dedup-script" data-directory="/tmp/project">'), 2)
         self.assertIn('id="queueMode"', page_text)
         self.assertIn('id="sweepFields" class="sweep-box form-wide" hidden', page_text)
         self.assertNotIn('id="sweepEnabled"', page_text)

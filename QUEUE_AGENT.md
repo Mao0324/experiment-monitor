@@ -29,6 +29,9 @@ Agent 服务固定从 `/opt/yolo-monitor-agent` 启动；每个实验仍会切�
 - Agent 按配置文件的 `script_scan_patterns` 扫描每个 `allowed_roots`，不会执行脚本；当前默认匹配 `train/*/train_dronevehicle*.py` 和 `train/*/train_flir*.py`。它使用 Python AST 提取实验名、默认 batch、默认 GPU、checkpoint 和 data/model 配置路径。
 - `script_scan_patterns` 接受字符串数组，例如 `["train_dronevehicle*.py", "train_flir*.py"]`。模式相对 `allowed_roots` 解析；如需扫描子目录，可显式使用 `**/train_flir*.py`。重叠模式会自动去重，绝对路径和包含 `..` 的越界模式会被忽略。
 - 网页选择脚本后会自动填写任务名、Python、工作目录和启动命令。脚本内置预训练权重只作只读提示；“断点 checkpoint”仅在续训时填写 `last.pt`。
+- 一个 Agent 可配置多个 `allowed_roots`。例如保留旧项目 `/media/biiteam/新加卷1/biiteam/MCONG/Yolov8_TwoStream`，再加入 `/data1/MCONG/TwoStream_Yolov8`；`train*.py` 会扫描新项目根目录的训练入口，原有 `train/*/train_*.py` 模式仍扫描旧项目的分类子目录。
+- 网页新增任务先选 Agent 已扫描的项目文件夹，再从该文件夹内搜索脚本；选择脚本后填写工作目录和启动命令。手动填写仍可用于尚未纳入扫描的脚本。
+
 - 新任务必须先通过无 GPU 预检：路径白名单、Python/脚本/checkpoint/data/model 文件、磁盘空间，以及在 `CUDA_VISIBLE_DEVICES=""` 下导入 PyTorch 和 Ultralytics。
 - 批量消融按“脚本 × batch”生成队列任务，单次最多 50 条。
 

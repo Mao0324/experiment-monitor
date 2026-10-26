@@ -75,5 +75,29 @@ class QueueUiTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def test_project_folder_precedes_and_filters_script_catalog(self):
+        root_a = "/media/project-a"
+        root_b = "/data1/MCONG/TwoStream_Yolov8"
+        catalog = [
+            {"id": "a", "name": "train_dronevehicle.py", "working_directory": root_a},
+            {"id": "b", "name": "train_escvehicle.py", "working_directory": root_b},
+            {"id": "c", "name": "train_gf_obb.py", "working_directory": root_b},
+        ]
+        agents = [
+            {"id": "slot-1", "hostname": "training-host", "catalog": catalog, "gpus": []},
+            {"id": "slot-2", "hostname": "training-host", "catalog": catalog, "gpus": []},
+        ]
+        page = self.server.queue_html([], agents)
+        self.assertLess(page.index('id="projectFolder"'), page.index('id="scriptSearch"'))
+        self.assertEqual(page.count(f'<option value="{root_a}">'), 1)
+        self.assertEqual(page.count(f'<option value="{root_b}">'), 1)
+        self.assertIn(f'<option value="b" data-directory="{root_b}">', page)
+        self.assertIn('item.root===folder.value', page)
+        self.assertIn('option.dataset.directory===chosen', page)
+        self.assertIn('workdir.value=folder.value', page)
+        self.assertIn('search.disabled=!chosen', page)
+        self.assertNotIn('__FOLDER_OPTIONS__', page)
+
+
 if __name__ == "__main__":
     unittest.main()

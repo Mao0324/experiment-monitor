@@ -2575,6 +2575,9 @@ STYLE += """
 """
 
 
+STYLE += ".script-picker-folder{margin-bottom:14px}.script-picker-folder>label{display:block;margin-bottom:5px}.script-picker-folder select{width:100%}.script-search-wrap>input:disabled{opacity:.6;cursor:not-allowed}"
+
+
 def page(title: str, body: str, refresh: int | None = None) -> str:
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -3225,7 +3228,20 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
                     continue
                 seen_catalogs.add(dedupe_key)
                 catalogs.append({**item, "agent_id": agent.get("id"), "hostname": hostname})
-    catalog_options = "".join(f'<option value="{html.escape(str(item.get("id") or ""))}">{html.escape(str(item.get("hostname") or "Agent"))} · {html.escape(str(item.get("name") or item.get("path") or "脚本"))}</option>' for item in catalogs)
+    folders = list(dict.fromkeys(
+        str(item.get("working_directory") or "").strip()
+        for item in catalogs if str(item.get("working_directory") or "").strip()
+    ))
+    folder_options = "".join(
+        f'<option value="{html.escape(folder, quote=True)}">{html.escape(folder)}</option>'
+        for folder in folders
+    )
+    catalog_options = "".join(
+        f'<option value="{html.escape(str(item.get("id") or ""), quote=True)}" '
+        f'data-directory="{html.escape(str(item.get("working_directory") or ""), quote=True)}">'
+        f'{html.escape(str(item.get("hostname") or "Agent"))} · {html.escape(str(item.get("name") or item.get("path") or "脚本"))}</option>'
+        for item in catalogs
+    )
     initial = clone_job or {}
     initial["command"] = initial.get("command_text", "")
     initial["source_job_id"] = initial.get("id", "") if clone_job else ""
@@ -3239,8 +3255,8 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     <div class="queue-view-bar" aria-label="队列视图"><button type="button" class="queue-view-button" data-view="current" aria-pressed="true">当前任务 <span>__ACTIVE_COUNT__</span></button><button type="button" class="queue-view-button" data-view="history" aria-pressed="false">历史任务 <span>__HISTORY_COUNT__</span></button></div>
     <div class="queue-filter-bar"><label for="queueSearch">搜索任务名<input id="queueSearch" class="filter-input" type="search" placeholder="输入任务名或任务 ID" autocomplete="off"></label><label for="queueStatusFilter">状态筛选<select id="queueStatusFilter" class="filter-input"></select></label><span id="queueFilterCount" class="queue-filter-count" aria-live="polite"></span></div>
     <div class="table-scroll"><table class="queue-table"><thead><tr><th>任务 / 操作</th><th>状态</th><th>优先级</th><th>GPU</th><th>预检</th><th>未启动原因 / 建议</th><th>尝试</th><th>异常策略</th></tr></thead><tbody>__JOB_ROWS__<tr id="queueEmpty" class="queue-empty" hidden><td colspan="8" class="empty">当前视图暂无任务</td></tr></tbody></table></div></div>
-    <details id="new-job" class="panel queue-create-disclosure"__FORM_OPEN__><summary class="queue-create-summary"><div><h3>__FORM_TITLE__</h3><div class="muted">选择训练脚本自动填表；提交前先做无 GPU 预检。</div></div><div class="queue-create-summary-side"><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="queue-create-body">
-    <form id="queueForm" class="grid queue-edit-form"><div class="form-wide script-picker" data-host-count="__CATALOG_HOST_COUNT__"><label for="scriptSearch">训练脚本选择器</label><div class="script-picker-control"><div class="script-search-wrap"><input id="scriptSearch" class="filter-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="scriptResults" placeholder="搜索 CPD004、flir 或脚本文件名" autocomplete="off"><div id="scriptResults" class="script-search-results" role="listbox" hidden></div></div><button id="scriptManual" class="button secondary" type="button">手动填写</button></div><div class="script-picker-help muted">输入关键词实时筛选，最多显示 10 条；也可以直接填写下方字段。</div><select id="scriptSelector" hidden><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></div>
+    <details id="new-job" class="panel queue-create-disclosure"__FORM_OPEN__><summary class="queue-create-summary"><div><h3>__FORM_TITLE__</h3><div class="muted">先选项目文件夹，再选训练脚本自动填表；提交前先做无 GPU 预检。</div></div><div class="queue-create-summary-side"><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="queue-create-body">
+    <form id="queueForm" class="grid queue-edit-form"><div class="form-wide script-picker" data-host-count="__CATALOG_HOST_COUNT__"><div class="script-picker-folder"><label for="projectFolder">项目文件夹</label><select id="projectFolder" class="filter-input"><option value="">请选择 Agent 已扫描的文件夹</option>__FOLDER_OPTIONS__</select></div><label for="scriptSearch">训练脚本选择器</label><div class="script-picker-control"><div class="script-search-wrap"><input id="scriptSearch" class="filter-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="scriptResults" placeholder="请先选择项目文件夹" disabled autocomplete="off"><div id="scriptResults" class="script-search-results" role="listbox" hidden></div></div><button id="scriptManual" class="button secondary" type="button">手动填写</button></div><div class="script-picker-help muted">先选择项目文件夹，再搜索脚本；手动填写仍可使用下方工作目录与启动命令。</div><select id="scriptSelector" hidden><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></div>
     <div id="scriptInfo" class="script-info form-wide muted">Agent 上线并完成扫描后，这里会显示脚本内置 checkpoint、数据配置和默认 GPU。</div>
     <div id="lineageInfo" class="script-info form-wide" hidden></div>
     <input name="script_id" type="hidden"><input name="script_path" type="hidden"><input name="source_job_id" type="hidden">
@@ -3306,15 +3322,16 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         const picker=document.querySelector('.script-picker');
         const search=document.getElementById('scriptSearch');
         const results=document.getElementById('scriptResults');
-        const selector=document.getElementById('scriptSelector');
-        const form=document.getElementById('queueForm');
+        const selector=document.getElementById('scriptSelector');const folder=document.getElementById('projectFolder');const sweepScripts=document.getElementById('sweepScripts');
+        const form=document.getElementById('queueForm');const workdir=form.elements.namedItem('working_directory');
         const showHost=Number(picker.dataset.hostCount)>1;
         const scripts=Array.from(selector.options).slice(1).map((option,index)=>{
           const text=option.textContent||'';
           const separator=text.indexOf(' · ');
-          return {option,index,name:separator<0?text:text.slice(separator+3),host:separator<0?'':text.slice(0,separator)};
+          return {option,index,name:separator<0?text:text.slice(separator+3),host:separator<0?'':text.slice(0,separator),root:option.dataset.directory||''};
         });
         let matches=[],active=-1;
+        function syncFolder(){const chosen=folder.value;search.disabled=!chosen;search.placeholder=chosen?'搜索 CPD004、flir 或脚本文件名':'请先选择项目文件夹';for(const option of sweepScripts.options){const available=option.dataset.directory===chosen;option.hidden=!available;option.disabled=!available;if(!available)option.selected=false}}
         function closeResults(){results.hidden=true;search.setAttribute('aria-expanded','false');search.removeAttribute('aria-activedescendant');active=-1}
         function clearBinding(){
           const wasBound=Boolean(selector.value);
@@ -3345,7 +3362,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         }
         function showResults(){
           const query=fold(search.value);
-          const found=scripts.filter(item=>fold(item.name+' '+item.host).includes(query));
+          const found=scripts.filter(item=>item.root===folder.value&&fold(item.name+' '+item.host).includes(query));
           matches=found.slice(0,10);
           active=-1;
           search.removeAttribute('aria-activedescendant');
@@ -3360,11 +3377,13 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             results.append(button);
           }
           const hint=document.createElement('div');hint.className='script-search-hint';
-          hint.textContent=found.length?('显示前 '+matches.length+' 条 / 共 '+found.length+' 条；继续输入可缩小范围'):(scripts.length?'没有匹配的脚本':'Agent 尚未发现脚本，请手动填写');
+          hint.textContent=found.length?('显示前 '+matches.length+' 条 / 共 '+found.length+' 条；继续输入可缩小范围'):(scripts.some(item=>item.root===folder.value)?'没有匹配的脚本':'这个文件夹尚未发现脚本，请手动填写');
           results.append(hint);
           results.hidden=false;
           search.setAttribute('aria-expanded','true');
         }
+        folder.addEventListener('change',()=>{search.value='';clearBinding();workdir.value=folder.value;syncFolder();closeResults()});
+        workdir.addEventListener('input',()=>{if(workdir.value!==folder.value){folder.value='';search.value='';clearBinding();syncFolder();closeResults()}});
         search.addEventListener('focus',showResults);
         search.addEventListener('input',()=>{clearBinding();showResults()});
         search.addEventListener('keydown',event=>{
@@ -3386,13 +3405,13 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             disclosure.open=true;search.focus();
           }
         },true);
-        const selected=scripts.find(item=>item.option.value===selector.value);
-        if(selected)search.value=selected.name;
+        if(Array.from(folder.options).some(option=>option.value===workdir.value))folder.value=workdir.value;const selected=scripts.find(item=>item.option.value===selector.value);if(selected&&!folder.value)folder.value=selected.root;syncFolder();
+        if(selected&&selected.root===folder.value)search.value=selected.name;
       });
     })();</script>
     <script>(()=>{const catalogs=__CATALOG_JSON__,initial=__INITIAL_JSON__,form=document.getElementById('queueForm'),selector=document.getElementById('scriptSelector'),message=document.getElementById('queueMessage'),policy=document.getElementById('queuePolicy'),batch=document.getElementById('queueBatch'),batchHint=document.getElementById('queueBatchHint'),queueMode=document.getElementById('queueMode'),sweepFields=document.getElementById('sweepFields'),sweepScripts=document.getElementById('sweepScripts'),lineageInfo=document.getElementById('lineageInfo');const field=n=>form.elements.namedItem(n),isSweep=()=>queueMode.value==='sweep';function showLineage(item){if(!item||!item.father_yaml_name){lineageInfo.hidden=true;lineageInfo.replaceChildren();return}lineageInfo.hidden=false;lineageInfo.replaceChildren();const title=document.createElement('strong');title.textContent='YAML 继承关系';lineageInfo.append(title,document.createElement('br'),document.createTextNode((item.model_yaml_name||'当前 YAML')+' → '+item.father_yaml_name),document.createElement('br'));const status=document.createElement('span');status.className='label';status.textContent=item.lineage_status==='matched'?'已精确匹配父 Run：'+item.father_run_name+'（'+item.father_run_id+'）':item.lineage_status==='run_missing'?'已识别父脚本，但监控库中暂未找到同名父 Run':item.lineage_status==='parent_script_missing'?'已识别父 YAML，但 Agent 目录中暂未找到对应父脚本':item.lineage_status==='reference_only'?'YAML 注释为“对照”，仅展示且不自动绑定':'父实验关系待解析';lineageInfo.append(status);if(item.change_summary){lineageInfo.append(document.createElement('br'),document.createTextNode('修改内容：'+item.change_summary))}}function applyScript(item,preserveName=false){if(!item)return;field('script_id').value=item.id||'';field('script_path').value=item.path||'';field('working_directory').value=item.working_directory||'';field('command').value=item.command||'';if(!preserveName)field('name').value=item.task_name||item.name||'';if(!preserveName||!field('baseline_run_id').value)field('baseline_run_id').value=item.father_run_id||'';if(item.default_batch)batch.value=item.default_batch;if(item.default_gpu_count)field('required_gpu_count').value=item.default_gpu_count;document.getElementById('scriptInfo').textContent='Python：'+(item.python||'—')+'　内置 checkpoint：'+(item.checkpoint||'未识别')+'　数据：'+((item.data_files||[]).join(', ')||'未识别')+'　默认 GPU：'+(item.default_device||'未识别');showLineage(item)}selector.addEventListener('change',()=>applyScript(catalogs.find(x=>x.id===selector.value)));function setInitial(){for(const [key,value] of Object.entries(initial)){const target=field(key);if(target&&value!==null&&value!==undefined){target.value=Array.isArray(value)?value.join(','):value}}if(initial.script_id){selector.value=initial.script_id;applyScript(catalogs.find(x=>x.id===initial.script_id),true)}if(initial.anomaly_policy)policy.value=initial.anomaly_policy}function syncBatchRequirement(){const required=policy.value==='retry_lower_batch';batch.required=required&&!isSweep();batch.placeholder=required?'必填，例如 64':'可留空';batchHint.textContent=required?'必填':'可留空'}function syncQueueMode(){sweepFields.hidden=!isSweep();syncBatchRequirement()}policy.addEventListener('change',syncBatchRequirement);queueMode.addEventListener('change',syncQueueMode);setInitial();syncQueueMode();form.addEventListener('submit',async e=>{e.preventDefault();syncBatchRequirement();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form).entries());if(isSweep()){const batches=document.getElementById('sweepBatches').value.replace(/，/g,',').split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);const scripts=Array.from(sweepScripts.selectedOptions).map(option=>catalogs.find(x=>x.id===option.value)).filter(Boolean);if(!batches.length||!scripts.length){message.textContent='批量扫描必须选择至少一个脚本并填写 batch 组合';return}data.sweep_jobs=[];for(const script of scripts)for(const value of batches)data.sweep_jobs.push({name:(script.task_name||script.name)+'-b'+value,working_directory:script.working_directory,command:script.command,script_id:script.id,script_path:script.path,batch_size:value,required_gpu_count:script.default_gpu_count||data.required_gpu_count,baseline_run_id:script.father_run_id||''});if(data.sweep_jobs.length>50){message.textContent='组合超过 50 条，请缩小范围';return}}message.textContent='正在创建并等待 Agent 预检…';const response=await fetch('/api/v1/web/queue',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(data)});let result={};try{result=await response.json()}catch{}message.textContent=response.ok?'已创建，预检结果将在队列表显示':(response.status===403?'管理员密码错误':result.error||'提交失败');if(response.ok)setTimeout(()=>location.href='/queue',700)});document.querySelectorAll('.queue-action').forEach(button=>button.addEventListener('click',async()=>{const action=button.dataset.action,labels={pause:'完成当前 Epoch 后暂停',resume:'从 checkpoint 恢复',cancel:'取消任务',requeue:'重新排队',requeue_resume:'从 checkpoint 续训',delete:'删除队列记录'};if(action==='delete'&&!confirm('仅删除这条符合条件的队列记录。实验结果、checkpoint 和训练文件不会被删除。确定继续吗？'))return;const password=prompt('请输入管理员密码以'+(labels[action]||'执行操作')+'：');if(password===null)return;const suffix=action==='delete'?'/delete':'/action';const body=action==='delete'?{password}:{password,action};const response=await fetch('/api/v1/web/queue/'+encodeURIComponent(button.dataset.id)+suffix,{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(body)});if(response.ok)location.reload();else{let result={};try{result=await response.json()}catch{}alert(response.status===403?'管理员密码错误':result.error||'操作失败')}}))})();</script></div>'''
     summary = f'<span class="summary-chip">待处理 <strong>{queue_counts["active"]}</strong></span><span class="summary-chip">已完成 <strong>{queue_counts["completed"]}</strong></span><span class="summary-chip">失败 <strong>{queue_counts["failed"]}</strong></span><span class="summary-chip cancelled">已取消 <strong>{queue_counts["cancelled"]}</strong></span>'
-    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
+    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__FOLDER_OPTIONS__", folder_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
 
 
 def queue_job_html(job: dict) -> str:
