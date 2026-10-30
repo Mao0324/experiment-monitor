@@ -4,17 +4,26 @@
   "agent_id": "biiteam-training-01",
   "worker_slots": 4,
   "allowed_roots": [
-    "/media/biiteam/新加卷/biiteam/MCONG/Yolov8_TwoStream"
+    "/media/biiteam/新加卷1/biiteam/MCONG/Yolov8_TwoStream",
+    "/data1/MCONG/TwoStream_Yolov8"
   ],
   "allowed_executables": ["python", "python3"],
   "training_python": "/home/biiteam/anaconda3/envs/spikeyolo/bin/python",
   "default_batch": 64,
+  "script_scan_patterns": [
+    "train/*/train_dronevehicle*.py",
+    "train/*/train_flir*.py",
+    "train/*/train_escvehicle*.py",
+    "train/*/train_llvip*.py",
+    "train*.py"
+  ],
   "script_scan_seconds": 300,
   "script_scan_limit": 300,
   "preflight_import_timeout_seconds": 90,
   "poll_seconds": 10,
   "gpu_idle_utilization_percent": 5,
   "gpu_idle_memory_used_mb": 3000,
+  "gpu_cuda_probe_seconds": 300,
   "idle_reminder_seconds": 2100,
   "idle_reminder_gpu_count": 2,
   "min_disk_free_gb": 20,

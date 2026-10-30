@@ -25,7 +25,7 @@
 - systemd 开机启动、故障重启和安全限制；
 - 上报失败不会中断 YOLO 训练。
 - 自动 DDP 使用共享 run ID，并且只有 Rank 0 上报，避免双卡产生重复实验。
-- Agent 自动扫描允许目录中的 `train_dronevehicle*.py` 并在网页选择脚本后自动填表；
+- Agent 按 `script_scan_patterns` 自动扫描允许目录中的训练脚本，并在网页选择脚本后自动填表；默认包含 `train_dronevehicle*.py` 和 `train_flir*.py`；
 - 新任务先做不占 GPU 的 Python、路径、checkpoint、数据配置、磁盘和依赖预检；
 - 队列逐项解释未启动原因，包括缺少 GPU 数、显存不足、利用率超限和剩余空闲时间；
 - 可复制历史队列任务或基于由队列启动的实验新建，并可按“脚本 × batch”批量生成消融任务；
@@ -57,11 +57,13 @@ desktop/
   build.ps1                         使用系统 C# 编译器生成 EXE
 client/
   yolo_monitor.py                   Ultralytics 回调及异常包装器
+  monitored_training.py             保留原 Trainer 的单卡训练接入层
   train_example.py                  最小接入示例
   monitored_target_saliency_trainer.py  可被 DDP 子进程重新导入的监控 Trainer
   train_dronevehicle_ddp_fixed.py   DroneVehicle 双卡修复示例
 tests/
   test_smoke.py                     本地端到端冒烟测试
+  test_monitored_training.py        轻量接入层的 Trainer 与 GPU 分配测试
 ```
 
 ## 安全边界
