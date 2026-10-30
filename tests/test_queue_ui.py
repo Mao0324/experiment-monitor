@@ -57,12 +57,14 @@ class QueueUiTest(unittest.TestCase):
 
         self.assertLess(page.index('class="queue-view-bar"'), page.index('id="new-job"'))
         self.assertIn('<details id="new-job" class="panel queue-create-disclosure">', page)
-        self.assertIn('data-view="current" data-status="running" data-name="CPD004_running"', page)
-        self.assertIn('data-view="history" data-status="completed" data-name="FLIR_completed" data-id="completed-1" hidden>', page)
+        self.assertIn('data-view="current" data-status="running" data-host="" data-name="CPD004_running"', page)
+        self.assertIn('data-view="history" data-status="completed" data-host="" data-name="FLIR_completed" data-id="completed-1" hidden>', page)
         self.assertIn('data-host-count="2"', page)
         self.assertIn('id="scriptSearch" class="filter-input" type="search" role="combobox"', page)
         self.assertIn('found.slice(0,10)', page)
         self.assertIn('id="queueStatusFilter"', page)
+        self.assertIn('id="queueHostFilter"', page)
+        self.assertLess(page.index('id="targetHost"'), page.index('id="projectFolder"'))
         self.assertNotIn('__FORM_OPEN__', page)
 
         clone = self.server.queue_html(jobs, agents, {"id": "running-1", "name": "CPD004_running"})
@@ -89,14 +91,59 @@ class QueueUiTest(unittest.TestCase):
         ]
         page = self.server.queue_html([], agents)
         self.assertLess(page.index('id="projectFolder"'), page.index('id="scriptSearch"'))
-        self.assertEqual(page.count(f'<option value="{root_a}">'), 1)
-        self.assertEqual(page.count(f'<option value="{root_b}">'), 1)
-        self.assertIn(f'<option value="b" data-directory="{root_b}">', page)
-        self.assertIn('item.root===folder.value', page)
-        self.assertIn('option.dataset.directory===chosen', page)
+        self.assertEqual(page.count(f'<option value="{root_a}" data-hostname="training-host">'), 1)
+        self.assertEqual(page.count(f'<option value="{root_b}" data-hostname="training-host">'), 1)
+        self.assertIn(f'<option value="b" data-directory="{root_b}" data-hostname="training-host">', page)
+        self.assertIn('item.host===host.value&&item.root===folder.value', page)
+        self.assertIn('option.dataset.hostname===host.value&&option.dataset.directory===chosen', page)
         self.assertIn('workdir.value=folder.value', page)
-        self.assertIn('search.disabled=!chosen', page)
+        self.assertIn('search.disabled=!(host.value&&chosen)', page)
         self.assertNotIn('__FOLDER_OPTIONS__', page)
+
+    def test_target_host_controls_preflight_and_claim(self):
+        store = self.server.Store(str(Path(self.temp.name) / "host-routing.db"))
+        store.heartbeat_agent({"agent_id": "old-slot", "hostname": "old-host", "gpus": []})
+        payload = {
+            "name": "legacy", "command": "python train.py", "working_directory": "/project",
+            "idle_seconds": 1,
+        }
+        legacy = store.create_queue_job(payload)
+        self.assertEqual(legacy["target_hostname"], "old-host")
+        # Reopening an upgraded database assigns older blank-host jobs before
+        # the second machine connects.
+        with store.connect() as conn:
+            conn.execute("UPDATE queue_jobs SET target_hostname='' WHERE id=?", (legacy["id"],))
+        store = self.server.Store(store.path)
+        self.assertEqual(store.get_queue_job(legacy["id"])["target_hostname"], "old-host")
+
+        store.heartbeat_agent({"agent_id": "new-slot", "hostname": "new-host", "gpus": []})
+        with self.assertRaisesRegex(ValueError, "target_hostname"):
+            store.create_queue_job(payload)
+        selected = store.create_queue_job({**payload, "name": "new-machine", "target_hostname": "new-host"})
+        store.update_queue_job(selected["id"], {"target_hostname": "old-host"})
+        self.assertEqual(store.get_queue_job(selected["id"])["target_hostname"], "old-host")
+        store.update_queue_job(selected["id"], {"target_hostname": "new-host"})
+        self.assertEqual([job["id"] for job in store.pending_preflights("new-slot")], [selected["id"]])
+        self.assertEqual([job["id"] for job in store.pending_preflights("old-slot")], [legacy["id"]])
+        with self.assertRaises(PermissionError):
+            store.complete_preflight(legacy["id"], {"agent_id": "new-slot", "status": "passed"})
+        store.complete_preflight(legacy["id"], {"agent_id": "old-slot", "status": "passed"})
+        gpu = [{"index": 0, "memory_free_mb": 20000, "utilization_percent": 0,
+                "idle_for_seconds": 100, "cuda_usable": True, "telemetry_usable": True}]
+        self.assertIsNone(store.claim_queue_job("new-slot", gpu))
+        self.assertEqual(store.claim_queue_job("old-slot", gpu)["id"], legacy["id"])
+
+    def test_identical_project_paths_remain_host_specific(self):
+        folder = "/shared/project"
+        agents = [
+            {"id": "old-slot", "hostname": "old-host", "catalog": [{"id": "same-script", "name": "train.py", "working_directory": folder}], "gpus": []},
+            {"id": "new-slot", "hostname": "new-host", "catalog": [{"id": "same-script", "name": "train.py", "working_directory": folder}], "gpus": []},
+        ]
+        page = self.server.queue_html([], agents)
+        self.assertIn(f'<option value="{folder}" data-hostname="old-host">', page)
+        self.assertIn(f'<option value="{folder}" data-hostname="new-host">', page)
+        self.assertIn('option.dataset.hostname===host.value', page)
+        self.assertNotIn('__HOST_OPTIONS__', page)
 
 
 if __name__ == "__main__":

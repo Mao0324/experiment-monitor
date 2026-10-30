@@ -337,6 +337,7 @@ class Store:
                     run_id TEXT NOT NULL DEFAULT '',
                     assigned_gpus_json TEXT NOT NULL DEFAULT '[]',
                     agent_id TEXT NOT NULL DEFAULT '',
+                    target_hostname TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -417,6 +418,7 @@ class Store:
                 "preflight_status": "TEXT NOT NULL DEFAULT 'passed'",
                 "preflight_json": "TEXT NOT NULL DEFAULT '{}'",
                 "script_id": "TEXT NOT NULL DEFAULT ''",
+                "target_hostname": "TEXT NOT NULL DEFAULT ''",
                 "script_path": "TEXT NOT NULL DEFAULT ''",
                 "source_job_id": "TEXT NOT NULL DEFAULT ''",
                 "sweep_group_id": "TEXT NOT NULL DEFAULT ''",
@@ -434,6 +436,11 @@ class Store:
             for column, definition in queue_migrations.items():
                 if column not in queue_columns:
                     conn.execute(f"ALTER TABLE queue_jobs ADD COLUMN {column} {definition}")
+            # Before a second training host joins, preserve the destination of
+            # historical jobs that were created when there was only one host.
+            known_hosts = [row[0] for row in conn.execute("SELECT DISTINCT hostname FROM agents WHERE hostname!=''")]
+            if len(known_hosts) == 1:
+                conn.execute("UPDATE queue_jobs SET target_hostname=? WHERE target_hostname=''", (known_hosts[0],))
             agent_columns = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
             agent_migrations = {
                 "catalog_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -893,12 +900,23 @@ class Store:
             result.pop("script_path", None)
         return result
 
+    def resolve_target_hostname(self, value: str | None) -> str:
+        target = str(value or "").strip()[:200]
+        with self.connect() as conn:
+            hosts = {str(row[0]) for row in conn.execute("SELECT DISTINCT hostname FROM agents WHERE hostname!=''")}
+        if target and target not in hosts:
+            raise ValueError("unknown training host")
+        if not target and len(hosts) > 1:
+            raise ValueError("target_hostname is required when multiple training hosts exist")
+        return target or (next(iter(hosts)) if hosts else "")
+
     def create_queue_job(self, payload: dict) -> dict:
         name = str(payload.get("name") or "").strip()[:200]
         command = str(payload.get("command") or "").strip()[:8000]
         working_directory = str(payload.get("working_directory") or "").strip()[:1000]
         if not name or not command or not working_directory:
             raise ValueError("name, command and working_directory are required")
+        target_hostname = self.resolve_target_hostname(payload.get("target_hostname"))
         raw_candidates = payload.get("gpu_candidates") or []
         if isinstance(raw_candidates, str):
             raw_candidates = raw_candidates.replace("，", ",").split(",")
@@ -926,7 +944,7 @@ class Store:
         run_id = secrets.token_hex(12)
         preflight_status = "pending"
         values = (
-            job_id, name, command, working_directory,
+            job_id, name, command, working_directory, target_hostname,
             max(-1000, min(1000, int(payload.get("priority") or 0))),
             max(1, min(16, int(payload.get("required_gpu_count") or 1))),
             json.dumps(candidates),
@@ -948,12 +966,12 @@ class Store:
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO queue_jobs
-                (id,name,status,command_text,working_directory,priority,required_gpu_count,
+                (id,name,status,command_text,working_directory,target_hostname,priority,required_gpu_count,
                  gpu_candidates_json,min_free_memory_mb,max_gpu_utilization,idle_seconds,
                  retry_limit,retry_delay_seconds,anomaly_policy,batch_size,min_batch_size,
                  resume_checkpoint,baseline_run_id,notes,run_id,created_at,updated_at,
                  preflight_status,script_id,script_path,source_job_id,sweep_group_id)
-                 VALUES (?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 VALUES (?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 values,
             )
             conn.execute(
@@ -1019,6 +1037,7 @@ class Store:
             working_directory = str(payload.get("working_directory", current["working_directory"]) or "").strip()[:1000]
             if not name or not command or not working_directory:
                 raise ValueError("name, command and working_directory are required")
+            target_hostname = self.resolve_target_hostname(payload.get("target_hostname", current.get("target_hostname")))
 
             raw_candidates = payload.get("gpu_candidates", current["gpu_candidates"])
             if isinstance(raw_candidates, str):
@@ -1040,7 +1059,7 @@ class Store:
             if policy == "retry_lower_batch" and batch_size is None:
                 raise ValueError("batch_size is required for retry_lower_batch")
             values = (
-                name, command, working_directory,
+                name, command, working_directory, target_hostname,
                 max(-1000, min(1000, int(payload.get("priority", current["priority"]) or 0))),
                 max(1, min(16, int(payload.get("required_gpu_count", current["required_gpu_count"]) or 1))),
                 json.dumps(candidates),
@@ -1056,7 +1075,7 @@ class Store:
                 str(payload.get("notes", current["notes"]) or "")[:8000], now, job_id,
             )
             cursor = conn.execute(
-                """UPDATE queue_jobs SET name=?,command_text=?,working_directory=?,priority=?,
+                """UPDATE queue_jobs SET name=?,command_text=?,working_directory=?,target_hostname=?,priority=?,
                 required_gpu_count=?,gpu_candidates_json=?,min_free_memory_mb=?,max_gpu_utilization=?,
                 idle_seconds=?,retry_limit=?,retry_delay_seconds=?,anomaly_policy=?,batch_size=?,
                 min_batch_size=?,resume_checkpoint=?,baseline_run_id=?,notes=?,updated_at=?,
@@ -1123,12 +1142,16 @@ class Store:
             if job.get("preflight_status") != "passed" or reasons:
                 job["queue_reasons"] = reasons
                 continue
-            if not agents:
-                reasons.append("没有在线训练 Agent")
+            target_hostname = str(job.get("target_hostname") or "")
+            eligible_agents = [agent for agent in agents if not target_hostname or agent.get("hostname") == target_hostname]
+            if not eligible_agents:
+                reasons.append(f"目标训练机 {target_hostname} 尚未接入 Agent" if target_hostname else "没有在线训练 Agent")
+                job["queue_reasons"] = reasons
+                continue
             candidates = set(job.get("gpu_candidates") or [])
             best_ready = 0
             best_details = []
-            for agent in agents:
+            for agent in eligible_agents:
                 ready = 0
                 details = []
                 reservations = reservations_by_host.get(str(agent.get("hostname") or ""), {})
@@ -1547,18 +1570,23 @@ class Store:
             rows = conn.execute("SELECT id FROM agents ORDER BY updated_at DESC").fetchall()
         return [agent for row in rows if (agent := self.get_agent(row["id"]))]
 
-    def pending_preflights(self, limit: int = 3) -> list[dict]:
+    def pending_preflights(self, agent_id: str, limit: int = 3) -> list[dict]:
         with self.connect() as conn:
+            agent = conn.execute("SELECT hostname FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent:
+                return []
             rows = conn.execute(
                 """SELECT * FROM queue_jobs WHERE status='queued' AND preflight_status='pending'
+                AND (target_hostname='' OR target_hostname=?)
                 ORDER BY priority DESC, created_at ASC LIMIT ?""",
-                (max(1, min(20, limit)),),
+                (agent["hostname"], max(1, min(20, limit))),
             ).fetchall()
         return [self._queue_row(row, True) for row in rows]
 
     def complete_preflight(self, job_id: str, payload: dict) -> dict | None:
         agent_id = str(payload.get("agent_id") or "")[:120]
-        if not self.get_agent(agent_id):
+        agent = self.get_agent(agent_id)
+        if not agent:
             raise PermissionError("agent must heartbeat before preflight")
         status = str(payload.get("status") or "failed")
         if status not in {"passed", "failed"}:
@@ -1567,9 +1595,11 @@ class Store:
         message = str(payload.get("message") or "")[:4000]
         result = {"agent_id": agent_id, "checks": checks[:50], "message": message, "checked_at": utc_now()}
         with self.connect() as conn:
-            exists = conn.execute("SELECT 1 FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
+            exists = conn.execute("SELECT target_hostname FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
             if not exists:
                 return None
+            if exists["target_hostname"] and exists["target_hostname"] != agent["hostname"]:
+                raise PermissionError("job targets another training host")
             conn.execute(
                 "UPDATE queue_jobs SET preflight_status=?,preflight_json=?,updated_at=?,last_error=CASE WHEN ?='failed' THEN ? ELSE '' END WHERE id=? AND status='queued'",
                 (status, json.dumps(result, ensure_ascii=False), utc_now(), status, message, job_id),
@@ -1613,6 +1643,8 @@ class Store:
             ).fetchall()
             for row in rows:
                 job = self._queue_row(row, True)
+                if job.get("target_hostname") and job["target_hostname"] != agent["hostname"]:
+                    continue
                 candidates = set(job["gpu_candidates"])
                 available = []
                 for gpu in gpus:
@@ -3135,6 +3167,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             if output_dir else '<div class="label">输出目录尚未绑定</div>'
         )
         task_name = html.escape(job["name"])
+        target_host = str(job.get("target_hostname") or "")
         if STORE.queue_job_editable(job):
             task_title = f'<a class="queue-task-title queue-task-link" href="/queue/jobs/{quote(job["id"])}" title="查看并修改任务配置">{task_name}</a>'
         else:
@@ -3153,8 +3186,8 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         view = "history" if status in {"completed", "failed", "cancelled"} else "current"
         initial_hidden = " hidden" if view == "history" else ""
         job_rows.append(
-            f'''<tr class="queue-row queue-{html.escape(status)}" data-view="{view}" data-status="{html.escape(status, quote=True)}" data-name="{html.escape(str(job['name']), quote=True)}" data-id="{html.escape(str(job['id']), quote=True)}"{initial_hidden}>
-            <td>{task_title}<br><span class="label">{html.escape(job['id'][:12])}</span>{cancelled_note}{output_binding}<div class="queue-actions">{''.join(actions)}</div></td>
+            f'''<tr class="queue-row queue-{html.escape(status)}" data-view="{view}" data-status="{html.escape(status, quote=True)}" data-host="{html.escape(target_host, quote=True)}" data-name="{html.escape(str(job['name']), quote=True)}" data-id="{html.escape(str(job['id']), quote=True)}"{initial_hidden}>
+            <td>{task_title}<br><span class="label">{html.escape(job['id'][:12])} · 训练机 {html.escape(target_host or '未指定')}</span>{cancelled_note}{output_binding}<div class="queue-actions">{''.join(actions)}</div></td>
             <td><span class="queue-status status-{html.escape(status)}">{html.escape(status_text)}</span></td>
             <td>{job['priority']}</td>
             <td><strong>{job['required_gpu_count']} 张</strong><br><span class="label">候选 {html.escape(candidates)}</span></td>
@@ -3208,7 +3241,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         state = str(agent.get("state") or "idle")
         current_job = str(agent.get("current_job_id") or "")
         current_job_html = f'<span class="label">当前任务 {html.escape(current_job[:12])}</span>' if current_job else ""
-        agent_cards.append(f'''<section class="agent-card"><div class="agent-heading"><div><h4>{html.escape(str(agent.get('hostname') or agent.get('id') or '未知主机'))}</h4><div class="agent-meta"><span class="label">Worker Slot · {html.escape(str(agent.get('id') or ''))}</span>{current_job_html}</div></div><div><span class="agent-state {'running' if state == 'running' else ''}">{html.escape(agent_state_labels.get(state, state))}</span><div class="label" style="margin-top:5px">心跳 {html.escape(str(agent.get('updated_at') or '—'))}</div></div></div><div class="gpu-grid">{''.join(gpu_cards)}</div></section>''')
+        agent_cards.append(f'''<section class="agent-card" data-host="{html.escape(str(agent.get('hostname') or ''), quote=True)}"><div class="agent-heading"><div><h4>{html.escape(str(agent.get('hostname') or agent.get('id') or '未知主机'))}</h4><div class="agent-meta"><span class="label">Worker Slot · {html.escape(str(agent.get('id') or ''))}</span>{current_job_html}</div></div><div><span class="agent-state {'running' if state == 'running' else ''}">{html.escape(agent_state_labels.get(state, state))}</span><div class="label" style="margin-top:5px">心跳 {html.escape(str(agent.get('updated_at') or '—'))}</div></div></div><div class="gpu-grid">{''.join(gpu_cards)}</div></section>''')
 
     queue_counts = {
         "active": sum(1 for job in jobs if job.get("status") not in {"completed", "failed", "cancelled"}),
@@ -3218,6 +3251,8 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     }
     catalogs = []
     seen_catalogs = set()
+    hostnames = list(dict.fromkeys(str(agent.get("hostname") or "").strip() for agent in agents if agent.get("hostname")))
+    host_options = "".join(f'<option value="{html.escape(host, quote=True)}">{html.escape(host)}</option>' for host in hostnames)
     for agent in agents:
         for item in agent.get("catalog") or []:
             if isinstance(item, dict):
@@ -3229,16 +3264,17 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
                 seen_catalogs.add(dedupe_key)
                 catalogs.append({**item, "agent_id": agent.get("id"), "hostname": hostname})
     folders = list(dict.fromkeys(
-        str(item.get("working_directory") or "").strip()
+        (str(item.get("hostname") or ""), str(item.get("working_directory") or "").strip())
         for item in catalogs if str(item.get("working_directory") or "").strip()
     ))
     folder_options = "".join(
-        f'<option value="{html.escape(folder, quote=True)}">{html.escape(folder)}</option>'
-        for folder in folders
+        f'<option value="{html.escape(folder, quote=True)}" data-hostname="{html.escape(host, quote=True)}">{html.escape(folder)}</option>'
+        for host, folder in folders
     )
     catalog_options = "".join(
         f'<option value="{html.escape(str(item.get("id") or ""), quote=True)}" '
-        f'data-directory="{html.escape(str(item.get("working_directory") or ""), quote=True)}">'
+        f'data-directory="{html.escape(str(item.get("working_directory") or ""), quote=True)}" '
+        f'data-hostname="{html.escape(str(item.get("hostname") or ""), quote=True)}">'
         f'{html.escape(str(item.get("hostname") or "Agent"))} · {html.escape(str(item.get("name") or item.get("path") or "脚本"))}</option>'
         for item in catalogs
     )
@@ -3253,10 +3289,10 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     template = '''<div class="wrap"><div class="top"><div><a href="/">← 全部实验</a><div class="brand">实验队列与训练 Agent</div><div class="muted">页面已启用登录保护；高风险操作仍需再次输入管理员密码。</div></div><div class="top-actions"><a class="button" href="#new-job">新增任务</a><a class="button secondary" href="/downloads/yolo-queue-agent.zip">下载 Linux Agent</a><a class="button secondary" href="/logout">退出登录</a></div></div>
     <div class="panel"><div class="panel-heading"><div><h3>队列</h3><div class="muted">先看正在运行与等待中的任务；历史任务可切换查看。</div></div><div class="queue-summary">__QUEUE_SUMMARY__</div></div>
     <div class="queue-view-bar" aria-label="队列视图"><button type="button" class="queue-view-button" data-view="current" aria-pressed="true">当前任务 <span>__ACTIVE_COUNT__</span></button><button type="button" class="queue-view-button" data-view="history" aria-pressed="false">历史任务 <span>__HISTORY_COUNT__</span></button></div>
-    <div class="queue-filter-bar"><label for="queueSearch">搜索任务名<input id="queueSearch" class="filter-input" type="search" placeholder="输入任务名或任务 ID" autocomplete="off"></label><label for="queueStatusFilter">状态筛选<select id="queueStatusFilter" class="filter-input"></select></label><span id="queueFilterCount" class="queue-filter-count" aria-live="polite"></span></div>
+    <div class="queue-filter-bar"><label for="queueSearch">搜索任务名<input id="queueSearch" class="filter-input" type="search" placeholder="输入任务名或任务 ID" autocomplete="off"></label><label for="queueStatusFilter">状态筛选<select id="queueStatusFilter" class="filter-input"></select></label><label for="queueHostFilter">训练机<select id="queueHostFilter" class="filter-input"><option value="">全部训练机</option>__HOST_OPTIONS__</select></label><span id="queueFilterCount" class="queue-filter-count" aria-live="polite"></span></div>
     <div class="table-scroll"><table class="queue-table"><thead><tr><th>任务 / 操作</th><th>状态</th><th>优先级</th><th>GPU</th><th>预检</th><th>未启动原因 / 建议</th><th>尝试</th><th>异常策略</th></tr></thead><tbody>__JOB_ROWS__<tr id="queueEmpty" class="queue-empty" hidden><td colspan="8" class="empty">当前视图暂无任务</td></tr></tbody></table></div></div>
-    <details id="new-job" class="panel queue-create-disclosure"__FORM_OPEN__><summary class="queue-create-summary"><div><h3>__FORM_TITLE__</h3><div class="muted">先选项目文件夹，再选训练脚本自动填表；提交前先做无 GPU 预检。</div></div><div class="queue-create-summary-side"><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="queue-create-body">
-    <form id="queueForm" class="grid queue-edit-form"><div class="form-wide script-picker" data-host-count="__CATALOG_HOST_COUNT__"><div class="script-picker-folder"><label for="projectFolder">项目文件夹</label><select id="projectFolder" class="filter-input"><option value="">请选择 Agent 已扫描的文件夹</option>__FOLDER_OPTIONS__</select></div><label for="scriptSearch">训练脚本选择器</label><div class="script-picker-control"><div class="script-search-wrap"><input id="scriptSearch" class="filter-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="scriptResults" placeholder="请先选择项目文件夹" disabled autocomplete="off"><div id="scriptResults" class="script-search-results" role="listbox" hidden></div></div><button id="scriptManual" class="button secondary" type="button">手动填写</button></div><div class="script-picker-help muted">先选择项目文件夹，再搜索脚本；手动填写仍可使用下方工作目录与启动命令。</div><select id="scriptSelector" hidden><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></div>
+    <details id="new-job" class="panel queue-create-disclosure"__FORM_OPEN__><summary class="queue-create-summary"><div><h3>__FORM_TITLE__</h3><div class="muted">先选训练机和项目文件夹，再选训练脚本；提交前先做无 GPU 预检。</div></div><div class="queue-create-summary-side"><span class="summary-chip">发现脚本 <strong>__CATALOG_COUNT__</strong></span><span class="agent-chevron" aria-hidden="true"></span></div></summary><div class="queue-create-body">
+    <form id="queueForm" class="grid queue-edit-form"><div class="form-wide script-picker" data-host-count="__CATALOG_HOST_COUNT__"><div class="script-picker-folder"><label for="targetHost">目标训练机</label><select id="targetHost" name="target_hostname" class="filter-input" required><option value="">请选择训练机</option>__HOST_OPTIONS__</select><label for="projectFolder">项目文件夹</label><select id="projectFolder" class="filter-input"><option value="">请选择该训练机已扫描的文件夹</option>__FOLDER_OPTIONS__</select></div><label for="scriptSearch">训练脚本选择器</label><div class="script-picker-control"><div class="script-search-wrap"><input id="scriptSearch" class="filter-input" type="search" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="scriptResults" placeholder="请先选择训练机和项目文件夹" disabled autocomplete="off"><div id="scriptResults" class="script-search-results" role="listbox" hidden></div></div><button id="scriptManual" class="button secondary" type="button">手动填写</button></div><div class="script-picker-help muted">先选训练机，再选项目文件夹和脚本；手动填写仍可使用下方工作目录与启动命令。</div><select id="scriptSelector" hidden><option value="">手动填写 / 选择脚本</option>__CATALOG_OPTIONS__</select></div>
     <div id="scriptInfo" class="script-info form-wide muted">Agent 上线并完成扫描后，这里会显示脚本内置 checkpoint、数据配置和默认 GPU。</div>
     <div id="lineageInfo" class="script-info form-wide" hidden></div>
     <input name="script_id" type="hidden"><input name="script_path" type="hidden"><input name="source_job_id" type="hidden">
@@ -3281,6 +3317,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         const viewButtons=Array.from(document.querySelectorAll('.queue-view-button'));
         const queueSearch=document.getElementById('queueSearch');
         const statusFilter=document.getElementById('queueStatusFilter');
+        const hostFilter=document.getElementById('queueHostFilter');
         const filterCount=document.getElementById('queueFilterCount');
         const emptyRow=document.getElementById('queueEmpty');
         const statusChoices={
@@ -3289,12 +3326,12 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         };
         let currentView='current';
         function filterQueue(){
-          const query=fold(queueSearch.value),status=statusFilter.value;
+          const query=fold(queueSearch.value),status=statusFilter.value,host=hostFilter.value;
           let shown=0,total=0;
           for(const row of rows){
             const inView=row.dataset.view===currentView;
             if(inView)total++;
-            const matches=inView&&(!status||row.dataset.status===status)&&(!query||fold(row.dataset.name+' '+row.dataset.id).includes(query));
+            const matches=inView&&(!status||row.dataset.status===status)&&(!host||row.dataset.host===host)&&(!query||fold(row.dataset.name+' '+row.dataset.id).includes(query));
             row.hidden=!matches;
             if(matches)shown++;
           }
@@ -3311,6 +3348,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         for(const button of viewButtons)button.addEventListener('click',()=>setView(button.dataset.view));
         queueSearch.addEventListener('input',filterQueue);
         statusFilter.addEventListener('change',filterQueue);
+        hostFilter.addEventListener('change',()=>{filterQueue();for(const card of document.querySelectorAll('.agent-card'))card.hidden=Boolean(hostFilter.value&&card.dataset.host!==hostFilter.value)});
         setView('current');
 
         const disclosure=document.getElementById('new-job');
@@ -3322,16 +3360,17 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         const picker=document.querySelector('.script-picker');
         const search=document.getElementById('scriptSearch');
         const results=document.getElementById('scriptResults');
-        const selector=document.getElementById('scriptSelector');const folder=document.getElementById('projectFolder');const sweepScripts=document.getElementById('sweepScripts');
+        const selector=document.getElementById('scriptSelector');const host=document.getElementById('targetHost');const folder=document.getElementById('projectFolder');const sweepScripts=document.getElementById('sweepScripts');
         const form=document.getElementById('queueForm');const workdir=form.elements.namedItem('working_directory');
         const showHost=Number(picker.dataset.hostCount)>1;
         const scripts=Array.from(selector.options).slice(1).map((option,index)=>{
           const text=option.textContent||'';
           const separator=text.indexOf(' · ');
-          return {option,index,name:separator<0?text:text.slice(separator+3),host:separator<0?'':text.slice(0,separator),root:option.dataset.directory||''};
+          return {option,index,name:separator<0?text:text.slice(separator+3),host:option.dataset.hostname||'',root:option.dataset.directory||''};
         });
         let matches=[],active=-1;
-        function syncFolder(){const chosen=folder.value;search.disabled=!chosen;search.placeholder=chosen?'搜索 CPD004、flir 或脚本文件名':'请先选择项目文件夹';for(const option of sweepScripts.options){const available=option.dataset.directory===chosen;option.hidden=!available;option.disabled=!available;if(!available)option.selected=false}}
+        function syncFolder(){const chosen=folder.value;search.disabled=!(host.value&&chosen);search.placeholder=host.value?(chosen?'搜索 CPD004、flir 或脚本文件名':'请先选择项目文件夹'):'请先选择训练机';for(const option of sweepScripts.options){const available=option.dataset.hostname===host.value&&option.dataset.directory===chosen;option.hidden=!available;option.disabled=!available;if(!available)option.selected=false}}
+        function syncHost(){for(const option of Array.from(folder.options).slice(1)){const available=option.dataset.hostname===host.value;option.hidden=!available;option.disabled=!available}if(folder.selectedOptions[0]?.disabled)folder.value='';syncFolder()}
         function closeResults(){results.hidden=true;search.setAttribute('aria-expanded','false');search.removeAttribute('aria-activedescendant');active=-1}
         function clearBinding(){
           const wasBound=Boolean(selector.value);
@@ -3343,7 +3382,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
           document.getElementById('scriptInfo').textContent='未绑定扫描脚本；可手动修改任务名称、工作目录和启动命令。';
         }
         function choose(item){
-          selector.value=item.option.value;
+          item.option.selected=true;
           selector.dispatchEvent(new Event('change',{bubbles:true}));
           search.value=item.name;
           closeResults();
@@ -3362,7 +3401,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         }
         function showResults(){
           const query=fold(search.value);
-          const found=scripts.filter(item=>item.root===folder.value&&fold(item.name+' '+item.host).includes(query));
+          const found=scripts.filter(item=>item.host===host.value&&item.root===folder.value&&fold(item.name).includes(query));
           matches=found.slice(0,10);
           active=-1;
           search.removeAttribute('aria-activedescendant');
@@ -3377,11 +3416,12 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             results.append(button);
           }
           const hint=document.createElement('div');hint.className='script-search-hint';
-          hint.textContent=found.length?('显示前 '+matches.length+' 条 / 共 '+found.length+' 条；继续输入可缩小范围'):(scripts.some(item=>item.root===folder.value)?'没有匹配的脚本':'这个文件夹尚未发现脚本，请手动填写');
+          hint.textContent=found.length?('显示前 '+matches.length+' 条 / 共 '+found.length+' 条；继续输入可缩小范围'):(scripts.some(item=>item.host===host.value&&item.root===folder.value)?'没有匹配的脚本':'这个文件夹尚未发现脚本，请手动填写');
           results.append(hint);
           results.hidden=false;
           search.setAttribute('aria-expanded','true');
         }
+        host.addEventListener('change',()=>{folder.value='';workdir.value='';search.value='';clearBinding();syncHost();closeResults()});
         folder.addEventListener('change',()=>{search.value='';clearBinding();workdir.value=folder.value;syncFolder();closeResults()});
         workdir.addEventListener('input',()=>{if(workdir.value!==folder.value){folder.value='';search.value='';clearBinding();syncFolder();closeResults()}});
         search.addEventListener('focus',showResults);
@@ -3405,13 +3445,13 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
             disclosure.open=true;search.focus();
           }
         },true);
-        if(Array.from(folder.options).some(option=>option.value===workdir.value))folder.value=workdir.value;const selected=scripts.find(item=>item.option.value===selector.value);if(selected&&!folder.value)folder.value=selected.root;syncFolder();
+        if(host.options.length===2&&!host.value)host.selectedIndex=1;syncHost();const matchingFolder=Array.from(folder.options).find(option=>option.value===workdir.value&&option.dataset.hostname===host.value);if(matchingFolder)matchingFolder.selected=true;const selected=scripts.find(item=>item.option.selected&&item.host===host.value);if(selected&&!folder.value){const option=Array.from(folder.options).find(value=>value.dataset.hostname===host.value&&value.value===selected.root);if(option)option.selected=true}syncFolder();
         if(selected&&selected.root===folder.value)search.value=selected.name;
       });
     })();</script>
     <script>(()=>{const catalogs=__CATALOG_JSON__,initial=__INITIAL_JSON__,form=document.getElementById('queueForm'),selector=document.getElementById('scriptSelector'),message=document.getElementById('queueMessage'),policy=document.getElementById('queuePolicy'),batch=document.getElementById('queueBatch'),batchHint=document.getElementById('queueBatchHint'),queueMode=document.getElementById('queueMode'),sweepFields=document.getElementById('sweepFields'),sweepScripts=document.getElementById('sweepScripts'),lineageInfo=document.getElementById('lineageInfo');const field=n=>form.elements.namedItem(n),isSweep=()=>queueMode.value==='sweep';function showLineage(item){if(!item||!item.father_yaml_name){lineageInfo.hidden=true;lineageInfo.replaceChildren();return}lineageInfo.hidden=false;lineageInfo.replaceChildren();const title=document.createElement('strong');title.textContent='YAML 继承关系';lineageInfo.append(title,document.createElement('br'),document.createTextNode((item.model_yaml_name||'当前 YAML')+' → '+item.father_yaml_name),document.createElement('br'));const status=document.createElement('span');status.className='label';status.textContent=item.lineage_status==='matched'?'已精确匹配父 Run：'+item.father_run_name+'（'+item.father_run_id+'）':item.lineage_status==='run_missing'?'已识别父脚本，但监控库中暂未找到同名父 Run':item.lineage_status==='parent_script_missing'?'已识别父 YAML，但 Agent 目录中暂未找到对应父脚本':item.lineage_status==='reference_only'?'YAML 注释为“对照”，仅展示且不自动绑定':'父实验关系待解析';lineageInfo.append(status);if(item.change_summary){lineageInfo.append(document.createElement('br'),document.createTextNode('修改内容：'+item.change_summary))}}function applyScript(item,preserveName=false){if(!item)return;field('script_id').value=item.id||'';field('script_path').value=item.path||'';field('working_directory').value=item.working_directory||'';field('command').value=item.command||'';if(!preserveName)field('name').value=item.task_name||item.name||'';if(!preserveName||!field('baseline_run_id').value)field('baseline_run_id').value=item.father_run_id||'';if(item.default_batch)batch.value=item.default_batch;if(item.default_gpu_count)field('required_gpu_count').value=item.default_gpu_count;document.getElementById('scriptInfo').textContent='Python：'+(item.python||'—')+'　内置 checkpoint：'+(item.checkpoint||'未识别')+'　数据：'+((item.data_files||[]).join(', ')||'未识别')+'　默认 GPU：'+(item.default_device||'未识别');showLineage(item)}selector.addEventListener('change',()=>applyScript(catalogs.find(x=>x.id===selector.value)));function setInitial(){for(const [key,value] of Object.entries(initial)){const target=field(key);if(target&&value!==null&&value!==undefined){target.value=Array.isArray(value)?value.join(','):value}}if(initial.script_id){selector.value=initial.script_id;applyScript(catalogs.find(x=>x.id===initial.script_id),true)}if(initial.anomaly_policy)policy.value=initial.anomaly_policy}function syncBatchRequirement(){const required=policy.value==='retry_lower_batch';batch.required=required&&!isSweep();batch.placeholder=required?'必填，例如 64':'可留空';batchHint.textContent=required?'必填':'可留空'}function syncQueueMode(){sweepFields.hidden=!isSweep();syncBatchRequirement()}policy.addEventListener('change',syncBatchRequirement);queueMode.addEventListener('change',syncQueueMode);setInitial();syncQueueMode();form.addEventListener('submit',async e=>{e.preventDefault();syncBatchRequirement();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form).entries());if(isSweep()){const batches=document.getElementById('sweepBatches').value.replace(/，/g,',').split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);const scripts=Array.from(sweepScripts.selectedOptions).map(option=>catalogs.find(x=>x.id===option.value)).filter(Boolean);if(!batches.length||!scripts.length){message.textContent='批量扫描必须选择至少一个脚本并填写 batch 组合';return}data.sweep_jobs=[];for(const script of scripts)for(const value of batches)data.sweep_jobs.push({name:(script.task_name||script.name)+'-b'+value,working_directory:script.working_directory,command:script.command,script_id:script.id,script_path:script.path,batch_size:value,required_gpu_count:script.default_gpu_count||data.required_gpu_count,baseline_run_id:script.father_run_id||''});if(data.sweep_jobs.length>50){message.textContent='组合超过 50 条，请缩小范围';return}}message.textContent='正在创建并等待 Agent 预检…';const response=await fetch('/api/v1/web/queue',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(data)});let result={};try{result=await response.json()}catch{}message.textContent=response.ok?'已创建，预检结果将在队列表显示':(response.status===403?'管理员密码错误':result.error||'提交失败');if(response.ok)setTimeout(()=>location.href='/queue',700)});document.querySelectorAll('.queue-action').forEach(button=>button.addEventListener('click',async()=>{const action=button.dataset.action,labels={pause:'完成当前 Epoch 后暂停',resume:'从 checkpoint 恢复',cancel:'取消任务',requeue:'重新排队',requeue_resume:'从 checkpoint 续训',delete:'删除队列记录'};if(action==='delete'&&!confirm('仅删除这条符合条件的队列记录。实验结果、checkpoint 和训练文件不会被删除。确定继续吗？'))return;const password=prompt('请输入管理员密码以'+(labels[action]||'执行操作')+'：');if(password===null)return;const suffix=action==='delete'?'/delete':'/action';const body=action==='delete'?{password}:{password,action};const response=await fetch('/api/v1/web/queue/'+encodeURIComponent(button.dataset.id)+suffix,{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(body)});if(response.ok)location.reload();else{let result={};try{result=await response.json()}catch{}alert(response.status===403?'管理员密码错误':result.error||'操作失败')}}))})();</script></div>'''
     summary = f'<span class="summary-chip">待处理 <strong>{queue_counts["active"]}</strong></span><span class="summary-chip">已完成 <strong>{queue_counts["completed"]}</strong></span><span class="summary-chip">失败 <strong>{queue_counts["failed"]}</strong></span><span class="summary-chip cancelled">已取消 <strong>{queue_counts["cancelled"]}</strong></span>'
-    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__FOLDER_OPTIONS__", folder_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
+    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__FOLDER_OPTIONS__", folder_options).replace("__HOST_OPTIONS__", host_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
 
 
 def queue_job_html(job: dict) -> str:
@@ -3427,6 +3467,12 @@ def queue_job_html(job: dict) -> str:
         for value, label in policy_options
     )
     candidates = ",".join(map(str, job.get("gpu_candidates") or []))
+    selected_host = str(job.get("target_hostname") or "")
+    hostnames = list(dict.fromkeys(str(agent.get("hostname") or "") for agent in STORE.list_agents() if agent.get("hostname")))
+    host_options = "".join(
+        f'<option value="{html.escape(host, quote=True)}"{" selected" if host == selected_host else ""}>{html.escape(host)}</option>'
+        for host in hostnames
+    )
     batch_size = "" if job.get("batch_size") is None else str(job["batch_size"])
     job_id = str(job["id"])
     output_dir = html.escape(str(job.get("output_dir") or "尚未绑定"))
@@ -3441,6 +3487,7 @@ def queue_job_html(job: dict) -> str:
       <div class="grid"><div class="stat"><div class="label">save_dir</div><div class="value" style="font-size:13px">{output_dir}</div></div><div class="stat"><div class="label">last.pt</div><div class="value" style="font-size:13px">{output_last}</div></div><div class="stat"><div class="label">best.pt</div><div class="value" style="font-size:13px">{output_best}</div></div><div class="stat"><div class="label">results.csv</div><div class="value" style="font-size:13px">{output_csv}</div></div></div></div>
     <div class="panel"><div class="panel-heading"><div><h3>任务配置</h3><div class="muted">这里显示的是加入队列时保存的完整配置。</div></div></div>
     <form id="queueEditForm" class="grid queue-edit-form">
+      <label>目标训练机<select name="target_hostname" class="filter-input" required><option value="">请选择训练机</option>{host_options}</select></label>
       <label>任务名称<input name="name" class="filter-input" maxlength="200" required value="{html.escape(job['name'])}"></label>
       <label>工作目录<input name="working_directory" class="filter-input" maxlength="1000" required value="{html.escape(job['working_directory'])}"></label>
       <label class="form-wide">启动命令<textarea name="command" class="filter-input command-preview" maxlength="8000" required>{html.escape(job['command_text'])}</textarea></label>
@@ -4211,7 +4258,7 @@ class Handler(BaseHTTPRequestHandler):
                 if notify:
                     threading.Thread(target=self.safe_idle_email, args=(agent,), daemon=True).start()
                 self.send_json(200, {"agent": agent, "idle_reminder": notify, "current_job": current_job,
-                                     "preflight_jobs": STORE.pending_preflights(3),
+                                     "preflight_jobs": STORE.pending_preflights(agent["id"], 3),
                                      "reconcile_jobs": STORE.reconciliation_jobs(agent["id"]) if
                                      agent.get("capabilities", {}).get("reconcile_v1") else []})
                 return
