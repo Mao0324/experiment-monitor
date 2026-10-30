@@ -145,6 +145,66 @@ class QueueUiTest(unittest.TestCase):
         self.assertIn('option.dataset.hostname===host.value', page)
         self.assertNotIn('__HOST_OPTIONS__', page)
 
+    def test_agent_host_view_is_independent_and_remembers_selection(self):
+        agents = [
+            {"id": "old-slot", "hostname": "old-host", "catalog": [], "gpus": []},
+            {"id": "old-slot-2", "hostname": "old-host", "catalog": [], "gpus": []},
+            {"id": "new-slot", "hostname": "new-host", "catalog": [], "gpus": []},
+        ]
+        page = self.server.queue_html([], agents)
+        self.assertIn('id="agentHostFilter"', page)
+        self.assertEqual(page.count('<option value="old-host">old-host · 2 Slot</option>'), 1)
+        self.assertEqual(page.count('<option value="new-host">new-host · 1 Slot</option>'), 1)
+        self.assertIn("localStorage.getItem(agentHostKey)", page)
+        self.assertIn("localStorage.setItem(agentHostKey,agentHostFilter.value)", page)
+        self.assertIn("hostFilter.addEventListener('change',filterQueue)", page)
+        self.assertIn("card.dataset.host!==agentHostFilter.value", page)
+        self.assertNotIn('__AGENT_HOST_OPTIONS__', page)
+
+        if shutil.which("node"):
+            start = page.index("const agentHostFilter=document.getElementById")
+            end = page.index("const disclosure=document.getElementById", start)
+            script = """
+                const assert = require('assert');
+                const memory = new Map([['mcong-lab-agent-host', 'new-host']]);
+                const localStorage = {
+                  getItem: key => memory.get(key) || null,
+                  setItem: (key, value) => memory.set(key, value),
+                };
+                const listeners = {};
+                const select = {
+                  value: '',
+                  options: [{value: ''}, {value: 'old-host'}, {value: 'new-host'}],
+                  addEventListener: (name, callback) => {listeners[name] = callback},
+                };
+                const cards = ['old-host', 'old-host', 'new-host'].map(host => ({dataset: {host}, hidden: false}));
+                const count = {textContent: ''};
+                const document = {
+                  getElementById: id => ({agentHostFilter: select, agentHostCount: count})[id],
+                  querySelectorAll: selector => {
+                    assert.equal(selector, '.agent-disclosure .agent-card');
+                    return cards;
+                  },
+                };
+            """ + page[start:end] + """
+                assert.equal(select.value, 'new-host');
+                assert.deepEqual(cards.map(card => card.hidden), [true, true, false]);
+                assert.equal(count.textContent, '1 个 Worker Slot');
+                select.value = 'old-host';
+                listeners.change();
+                assert.equal(memory.get('mcong-lab-agent-host'), 'old-host');
+                assert.deepEqual(cards.map(card => card.hidden), [false, false, true]);
+                select.value = '';
+                listeners.change();
+                assert.deepEqual(cards.map(card => card.hidden), [false, false, false]);
+            """
+            result = subprocess.run(["node"], input=script, text=True, encoding="utf-8", capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        empty = self.server.queue_html([], [])
+        self.assertIn('id="agentHostFilter"', empty)
+        self.assertIn('还没有 Agent 上线', empty)
+
     def test_reconciliation_stays_on_the_job_training_host(self):
         store = self.server.Store(str(Path(self.temp.name) / "host-reconciliation.db"))
         store.heartbeat_agent({"agent_id": "old-slot", "hostname": "old-host", "gpus": []})
