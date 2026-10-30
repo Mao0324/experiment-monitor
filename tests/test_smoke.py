@@ -1350,7 +1350,7 @@ class SmokeTest(unittest.TestCase):
         with urlopen(self.base + "/queue", timeout=2) as response:
             queue_page = response.read().decode("utf-8")
         self.assertIn('id="lineageInfo"', queue_page)
-        self.assertIn("选择脚本后自动匹配", queue_page)
+        self.assertIn("选择脚本后优先自动匹配", queue_page)
 
 
 if __name__ == "__main__":

@@ -1314,27 +1314,41 @@ class Store:
                 return row
         task_name = str(item.get("task_name") or "").strip()
         if task_name:
-            return conn.execute(
-                """SELECT id,name FROM runs WHERE name=? COLLATE NOCASE
-                ORDER BY CASE status WHEN 'completed' THEN 0 ELSE 1 END, started_at DESC LIMIT 1""",
+            rows = conn.execute(
+                """SELECT id,name,parameters_json FROM runs WHERE name=? COLLATE NOCASE
+                ORDER BY CASE status WHEN 'completed' THEN 0 ELSE 1 END, started_at DESC""",
                 (task_name,),
-            ).fetchone()
+            ).fetchall()
+            working_directory = str(item.get("working_directory") or "")
+            entrypoint = Path(str(item.get("path") or "")).name
+            exact = [row for row in rows if (
+                (repro := safe_json(row["parameters_json"], {}).get("reproducibility") or {})
+                .get("working_directory") == working_directory
+                and repro.get("entrypoint") == entrypoint
+            )]
+            if exact:
+                return exact[0]
+            if len(rows) == 1:
+                repro = safe_json(rows[0]["parameters_json"], {}).get("reproducibility") or {}
+                if not repro.get("working_directory") and not repro.get("entrypoint"):
+                    return rows[0]
         return None
 
     def reconcile_catalog_lineage(self):
         """Close explicit YAML father links whenever either catalogs or runs change."""
         with self.connect() as conn:
-            agent_rows = conn.execute("SELECT id,catalog_json FROM agents").fetchall()
+            agent_rows = conn.execute("SELECT id,hostname,catalog_json FROM agents").fetchall()
+            host_by_agent = {row["id"]: row["hostname"] for row in agent_rows}
             catalogs = {
                 row["id"]: [item for item in safe_json(row["catalog_json"], []) if isinstance(item, dict)]
                 for row in agent_rows
             }
-            all_items = [item for catalog in catalogs.values() for item in catalog]
             by_yaml_name = {}
-            for item in all_items:
-                yaml_name = str(item.get("model_yaml_name") or "").strip().casefold()
-                if yaml_name:
-                    by_yaml_name.setdefault(yaml_name, []).append(item)
+            for agent_id, catalog in catalogs.items():
+                for item in catalog:
+                    yaml_name = str(item.get("model_yaml_name") or "").strip().casefold()
+                    if yaml_name:
+                        by_yaml_name.setdefault(yaml_name, []).append((host_by_agent[agent_id], item))
 
             for agent_id, catalog in catalogs.items():
                 changed = False
@@ -1348,10 +1362,16 @@ class Store:
                     if relation == "reference":
                         resolved["lineage_status"] = "reference_only"
                     elif relation == "father" and father_name:
-                        candidates = by_yaml_name.get(father_name.casefold(), [])
-                        if candidates:
-                            same_root = [candidate for candidate in candidates if candidate.get("working_directory") == item.get("working_directory")]
-                            father_item = (same_root or candidates)[0]
+                        candidates = [candidate for hostname, candidate in by_yaml_name.get(father_name.casefold(), [])
+                                      if hostname == host_by_agent[agent_id]]
+                        same_root = [candidate for candidate in candidates
+                                     if candidate.get("working_directory") == item.get("working_directory")]
+                        father_path = str(item.get("father_yaml") or "").casefold()
+                        exact_path = [candidate for candidate in same_root
+                                      if str(candidate.get("model_yaml") or "").casefold() == father_path]
+                        matching = exact_path if father_path else same_root
+                        if len({str(candidate.get("id") or "") for candidate in matching}) == 1:
+                            father_item = matching[0]
                             father_task_name = str(father_item.get("task_name") or "").strip()
                             resolved["father_task_name"] = father_task_name
                             if father_task_name:
@@ -1366,6 +1386,8 @@ class Store:
                                     resolved["lineage_status"] = "run_missing"
                             else:
                                 resolved["lineage_status"] = "parent_name_missing"
+                        elif matching:
+                            resolved["lineage_status"] = "parent_ambiguous"
                         else:
                             resolved["lineage_status"] = "parent_script_missing"
                     for field, value in resolved.items():
@@ -1464,11 +1486,9 @@ class Store:
                         else:
                             conclusion = "实验已完成；基线缺少同名可比指标，暂不做优劣判断。"
                     else:
-                        conclusion = "实验已完成；尚未绑定可用 baseline，暂不做优劣判断。"
+                        conclusion = "实验已完成；已记录本实验结果，暂无明确的父实验可供对比。"
                 if not str(row["next_step"] or "").strip():
-                    if not baseline_id:
-                        next_step = "绑定明确的 baseline Run ID，再按同一指标完成对比。"
-                    elif row["status"] == "completed":
+                    if baseline_id and row["status"] == "completed":
                         next_step = "复核运行日志并重复实验，确认指标差异具有稳定性。"
                     elif row["status"] in {"failed", "stalled"}:
                         next_step = "先定位失败或中断原因，修复后从可用 checkpoint 复现。"
@@ -2836,6 +2856,28 @@ def experiment_display_name(name: str) -> tuple[str, str]:
     return code, details
 
 
+def baseline_run_options(selected_id: str = "", exclude_id: str = "") -> str:
+    with STORE.connect() as conn:
+        runs = [dict(row) for row in conn.execute(
+            "SELECT id,name FROM runs ORDER BY started_at DESC LIMIT 2000"
+        ).fetchall()]
+    if selected_id and all(run["id"] != selected_id for run in runs):
+        selected = STORE.get_run(selected_id)
+        if selected:
+            runs.insert(0, selected)
+    options = ['<option value="">不指定（有明确 YAML 父实验时自动匹配）</option>']
+    for run in runs:
+        if run["id"] == exclude_id:
+            continue
+        code, subtitle = experiment_display_name(run["name"])
+        label = f'{code} · {(subtitle or run["name"])[:80]} · Run {run["id"][:10]}'
+        options.append(
+            f'<option value="{html.escape(run["id"], quote=True)}"'
+            f'{" selected" if run["id"] == selected_id else ""}>{html.escape(label)}</option>'
+        )
+    return "".join(options)
+
+
 def dashboard_run(run: dict, best_values: dict[str, float] | None = None) -> dict:
     keys = (
         "id", "name", "status", "total_epochs", "current_epoch", "started_at",
@@ -2915,7 +2957,28 @@ def dashboard_payload(runs: list[dict] | None = None) -> dict:
     related_ids = {str(run["id"]) for run in runs}
     related_ids.update(str(run.get("baseline_run_id")) for run in runs if run.get("baseline_run_id"))
     best_values = STORE.best_map50_95_by_run(related_ids)
-    return {"runs": [dashboard_run(run, best_values) for run in runs], "summary": dashboard_summary()}
+    items = [dashboard_run(run, best_values) for run in runs]
+    by_code = {}
+    for item in items:
+        by_code.setdefault(item["display_code"], []).append(item)
+    for item in items:
+        siblings = by_code[item["display_code"]]
+        item["display_title"] = item["display_code"]
+        item["display_disambiguated"] = len(siblings) > 1
+        if len(siblings) < 2:
+            continue
+        parts = item["display_subtitle"].split(" · ") if item["display_subtitle"] else []
+        for size in range(1, len(parts) + 1):
+            suffix = " · ".join(parts[:size])
+            if sum(other["display_subtitle"].startswith(suffix) for other in siblings) == 1:
+                item["display_title"] += " · " + suffix
+                break
+        else:
+            run_id = item["id"]
+            short_id = next((run_id[:size] for size in range(8, len(run_id) + 1)
+                             if sum(other["id"].startswith(run_id[:size]) for other in siblings) == 1), run_id)
+            item["display_title"] += " · Run " + short_id
+    return {"runs": items, "summary": dashboard_summary()}
 
 
 def run_snapshot(run: dict, events: list[dict]) -> dict:
@@ -3055,9 +3118,9 @@ def dashboard_html(runs: list[dict]) -> str:
       function renderSummary(s){const data=s||{};for(const [id,key] of [['summaryRunning','running'],['summaryQueued','queued'],['summaryCompleted','completed'],['summaryFailed','failed'],['summaryToday','completed_today']])document.getElementById(id).textContent=data[key]??'—';document.getElementById('summaryGpu').textContent=data.gpu_total?data.gpu_busy+' / '+data.gpu_total:'—';document.getElementById('summaryGpuFoot').textContent=data.gpu_total?'按 Agent 空闲阈值判定':'暂无新鲜 GPU 遥测';document.getElementById('summaryFailedFoot').textContent=data.stalled?'另有 '+data.stalled+' 条疑似掉线':'需要处理的记录'}
       function updateOptions(select,values,label){const current=select.value;select.replaceChildren();const first=document.createElement('option');first.value='';first.textContent=label;select.appendChild(first);[...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-CN')).forEach(value=>{const o=document.createElement('option');o.value=value;o.textContent=value;select.appendChild(o)});if([...select.options].some(o=>o.value===current))select.value=current}
       function refreshFilterOptions(){updateOptions(groupFilter,runs.map(r=>r.group_name),'全部分组');updateOptions(tagFilter,runs.flatMap(r=>r.tags||[]),'全部标签')}
-      function matches(run){const q=nameFilter.value.trim().toLowerCase();return(!q||[run.name,run.display_code,run.display_subtitle].some(v=>String(v||'').toLowerCase().includes(q)))&&(!statusFilter.value||run.status===statusFilter.value)&&(!groupFilter.value||run.group_name===groupFilter.value)&&(!tagFilter.value||(run.tags||[]).includes(tagFilter.value))&&(!favoriteFilter.checked||run.favorite)}
+      function matches(run){const q=nameFilter.value.trim().toLowerCase();return(!q||[run.id,run.name,run.display_code,run.display_title,run.display_subtitle].some(v=>String(v||'').toLowerCase().includes(q)))&&(!statusFilter.value||run.status===statusFilter.value)&&(!groupFilter.value||run.group_name===groupFilter.value)&&(!tagFilter.value||(run.tags||[]).includes(tagFilter.value))&&(!favoriteFilter.checked||run.favorite)}
       async function setFavorite(run,value){const password=prompt('收藏操作需要管理员密码：');if(password===null)return;const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(run.id)+'/metadata',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify({favorite:value,password})});if(!response.ok)alert(response.status===403?'管理员密码错误':'收藏更新失败');else{run.favorite=value;render()}}
-      function render(){rows.replaceChildren();const visible=runs.filter(matches);document.getElementById('visibleCount').textContent='显示 '+visible.length+' / '+runs.length+' 条近期记录';visible.forEach(run=>{const tr=document.createElement('tr');const choose=add(tr,'td');const cb=document.createElement('input');cb.type='checkbox';cb.name='run';cb.value=run.id;cb.className='compare-box';cb.checked=selected.has(run.id);cb.setAttribute('aria-label','选择 '+run.name);cb.addEventListener('change',()=>{cb.checked?selected.add(run.id):selected.delete(run.id);sessionStorage.setItem(selectionKey,JSON.stringify([...selected]))});choose.appendChild(cb);const favCell=add(tr,'td');const star=add(favCell,'button',run.favorite?'★':'☆','favorite-button'+(run.favorite?' active':''));star.type='button';star.title=run.favorite?'取消收藏':'收藏实验';star.addEventListener('click',()=>setFavorite(run,!run.favorite));const info=add(tr,'td',undefined,'run-cell');const link=add(info,'a',run.display_code||run.name,'run-title');link.href='/runs/'+encodeURIComponent(run.id);link.title=run.name;if(run.display_subtitle)add(info,'span',run.display_subtitle,'run-subtitle');if(run.group_name)add(info,'span',run.group_name,'run-subtitle');const tertiary=add(info,'span',run.git_short?'Git '+run.git_short:'Run '+run.id.slice(0,12),'run-tertiary');tertiary.title=run.name;(run.tags||[]).forEach(tag=>add(info,'span',tag,'tag'));const status=add(tr,'td');add(status,'span',statusLabels[run.status]||run.status,'badge '+run.status);const progress=add(tr,'td',undefined,'progress-cell');const pct=run.total_epochs?Math.min(100,Math.round(100*(run.current_epoch||0)/run.total_epochs)):0;add(progress,'span',(run.current_epoch||0)+' / '+(run.total_epochs||0)+' · '+pct+'%','progress-text');const bar=add(progress,'div',undefined,'bar');add(bar,'div',undefined,'fill').style.width=pct+'%';const result=add(tr,'td',undefined,'result-cell');if(run.best_map50_95!==null&&run.best_map50_95!==undefined){add(result,'span',Number(run.best_map50_95).toFixed(4),'result-main');if(run.baseline_delta_pp!==null&&run.baseline_delta_pp!==undefined){const d=Number(run.baseline_delta_pp);add(result,'span',(d>=0?'↑ +':'↓ ')+d.toFixed(2)+' pp','result-delta '+(d>=0?'delta-up':'delta-down'))}}else add(result,'span','—','muted');const updated=add(tr,'td',undefined,'time-cell');const time=timeLabel(run.updated_at);add(updated,'span',time.short);updated.title=time.full;add(tr,'td',duration(run.elapsed_seconds),'hide-small');rows.appendChild(tr)});if(!visible.length){const tr=document.createElement('tr'),td=add(tr,'td','没有符合筛选条件的实验','empty');td.colSpan=8;rows.appendChild(tr)}}
+      function render(){rows.replaceChildren();const visible=runs.filter(matches);document.getElementById('visibleCount').textContent='显示 '+visible.length+' / '+runs.length+' 条近期记录';visible.forEach(run=>{const tr=document.createElement('tr');const choose=add(tr,'td');const cb=document.createElement('input');cb.type='checkbox';cb.name='run';cb.value=run.id;cb.className='compare-box';cb.checked=selected.has(run.id);cb.setAttribute('aria-label','选择 '+run.name);cb.addEventListener('change',()=>{cb.checked?selected.add(run.id):selected.delete(run.id);sessionStorage.setItem(selectionKey,JSON.stringify([...selected]))});choose.appendChild(cb);const favCell=add(tr,'td');const star=add(favCell,'button',run.favorite?'★':'☆','favorite-button'+(run.favorite?' active':''));star.type='button';star.title=run.favorite?'取消收藏':'收藏实验';star.addEventListener('click',()=>setFavorite(run,!run.favorite));const info=add(tr,'td',undefined,'run-cell');const link=add(info,'a',run.display_title||run.display_code||run.name,'run-title');link.href='/runs/'+encodeURIComponent(run.id);link.title=run.name;if(run.display_subtitle)add(info,'span',run.display_subtitle,'run-subtitle');if(run.group_name)add(info,'span',run.group_name,'run-subtitle');const identity=(run.display_disambiguated?'Run '+run.id.slice(0,12):'')+(run.git_short?(run.display_disambiguated?' · ':'')+'Git '+run.git_short:'');const tertiary=add(info,'span',identity||'Run '+run.id.slice(0,12),'run-tertiary');tertiary.title=run.name;(run.tags||[]).forEach(tag=>add(info,'span',tag,'tag'));const status=add(tr,'td');add(status,'span',statusLabels[run.status]||run.status,'badge '+run.status);const progress=add(tr,'td',undefined,'progress-cell');const pct=run.total_epochs?Math.min(100,Math.round(100*(run.current_epoch||0)/run.total_epochs)):0;add(progress,'span',(run.current_epoch||0)+' / '+(run.total_epochs||0)+' · '+pct+'%','progress-text');const bar=add(progress,'div',undefined,'bar');add(bar,'div',undefined,'fill').style.width=pct+'%';const result=add(tr,'td',undefined,'result-cell');if(run.best_map50_95!==null&&run.best_map50_95!==undefined){add(result,'span',Number(run.best_map50_95).toFixed(4),'result-main');if(run.baseline_delta_pp!==null&&run.baseline_delta_pp!==undefined){const d=Number(run.baseline_delta_pp);add(result,'span',(d>=0?'↑ +':'↓ ')+d.toFixed(2)+' pp','result-delta '+(d>=0?'delta-up':'delta-down'))}}else add(result,'span','—','muted');const updated=add(tr,'td',undefined,'time-cell');const time=timeLabel(run.updated_at);add(updated,'span',time.short);updated.title=time.full;add(tr,'td',duration(run.elapsed_seconds),'hide-small');rows.appendChild(tr)});if(!visible.length){const tr=document.createElement('tr'),td=add(tr,'td','没有符合筛选条件的实验','empty');td.colSpan=8;rows.appendChild(tr)}}
       [nameFilter,statusFilter,groupFilter,tagFilter,favoriteFilter].forEach(control=>control.addEventListener('input',render));form.addEventListener('submit',e=>{const ids=[...form.querySelectorAll('input[name=run]:checked')].map(x=>x.value);if(ids.length<2||ids.length>5){e.preventDefault();alert('请选择 2–5 条实验记录进行对比。')}else sessionStorage.removeItem(selectionKey)});
       const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText'),stream=new EventSource('/events/dashboard');stream.onopen=()=>{dot.classList.remove('offline');liveText.textContent='实时连接正常'};stream.onerror=()=>{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'};stream.onmessage=event=>{const data=JSON.parse(event.data);runs=data.runs||[];renderSummary(data.summary);refreshFilterOptions();render()};renderSummary(initial.summary);refreshFilterOptions();render();setInterval(render,60000);
     })();
@@ -3292,6 +3355,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     initial = clone_job or {}
     initial["command"] = initial.get("command_text", "")
     initial["source_job_id"] = initial.get("id", "") if clone_job else ""
+    baseline_options = baseline_run_options(str(initial.get("baseline_run_id") or ""))
     host_count = len({
         str(agent.get("hostname") or agent.get("id") or "").strip().casefold()
         for agent in agents if agent.get("hostname") or agent.get("id")
@@ -3315,7 +3379,7 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
     <label>失败重试次数<input name="retry_limit" type="number" min="0" max="20" class="filter-input" value="0"></label><label>重试等待（秒）<input name="retry_delay_seconds" type="number" min="5" class="filter-input" value="60"></label>
     <label>异常策略<select id="queuePolicy" name="anomaly_policy" class="filter-input"><option value="notify">仅通知</option><option value="stop">直接停止</option><option value="retry_lower_batch">降低 batch 后重试</option><option value="retry_when_memory">等待显存重试</option></select></label><label><span>初始 batch <span id="queueBatchHint" class="label">可留空</span></span><input id="queueBatch" name="batch_size" type="number" min="1" class="filter-input" placeholder="可留空"></label>
     <label>最小 batch<input name="min_batch_size" type="number" min="1" class="filter-input" value="1"></label><label>断点 checkpoint<input name="resume_checkpoint" class="filter-input" placeholder="仅续训时填写 last.pt；脚本预训练权重不用填"></label>
-    <label>基线 Run ID<input name="baseline_run_id" class="filter-input" placeholder="选择脚本后自动匹配；仍可手动修改"></label><label>管理员密码<input name="password" type="password" class="filter-input" required></label>
+    <details class="form-wide"><summary>对比基线（可选；选择脚本后优先自动匹配）</summary><label>手动指定实验<select name="baseline_run_id" class="filter-input">__BASELINE_OPTIONS__</select></label></details><label>管理员密码<input name="password" type="password" class="filter-input" required></label>
     <label class="form-wide">任务备注<textarea name="notes" class="filter-input"></textarea></label>
     <div class="queue-mode-row form-wide"><label>任务创建方式<select id="queueMode" class="filter-input"><option value="single">单个队列任务</option><option value="sweep">批量消融 / 参数扫描</option></select></label><span class="muted">选择批量模式后，参数组合会在下方展开。</span></div>
     <div id="sweepFields" class="sweep-box form-wide" hidden><div class="panel-heading"><div><strong>批量消融 / 参数扫描</strong><div class="muted">选择多个脚本和 batch，自动生成实验组合。</div></div><span class="summary-chip">最多 50 条</span></div><div class="grid"><label>batch 组合<input id="sweepBatches" class="filter-input" placeholder="64,32,16"></label><label class="form-wide">脚本组合（Ctrl / Shift 多选）<select id="sweepScripts" class="filter-input" multiple size="5">__CATALOG_OPTIONS__</select></label><div class="muted form-wide">将按“脚本 × batch”生成任务；模型/配置组合请用不同训练脚本表示。</div></div></div>
@@ -3482,9 +3546,9 @@ def queue_html(jobs: list[dict], agents: list[dict], clone_job: dict | None = No
         if(selected&&selected.root===folder.value)search.value=selected.name;
       });
     })();</script>
-    <script>(()=>{const catalogs=__CATALOG_JSON__,initial=__INITIAL_JSON__,form=document.getElementById('queueForm'),selector=document.getElementById('scriptSelector'),message=document.getElementById('queueMessage'),policy=document.getElementById('queuePolicy'),batch=document.getElementById('queueBatch'),batchHint=document.getElementById('queueBatchHint'),queueMode=document.getElementById('queueMode'),sweepFields=document.getElementById('sweepFields'),sweepScripts=document.getElementById('sweepScripts'),lineageInfo=document.getElementById('lineageInfo');const field=n=>form.elements.namedItem(n),isSweep=()=>queueMode.value==='sweep';function showLineage(item){if(!item||!item.father_yaml_name){lineageInfo.hidden=true;lineageInfo.replaceChildren();return}lineageInfo.hidden=false;lineageInfo.replaceChildren();const title=document.createElement('strong');title.textContent='YAML 继承关系';lineageInfo.append(title,document.createElement('br'),document.createTextNode((item.model_yaml_name||'当前 YAML')+' → '+item.father_yaml_name),document.createElement('br'));const status=document.createElement('span');status.className='label';status.textContent=item.lineage_status==='matched'?'已精确匹配父 Run：'+item.father_run_name+'（'+item.father_run_id+'）':item.lineage_status==='run_missing'?'已识别父脚本，但监控库中暂未找到同名父 Run':item.lineage_status==='parent_script_missing'?'已识别父 YAML，但 Agent 目录中暂未找到对应父脚本':item.lineage_status==='reference_only'?'YAML 注释为“对照”，仅展示且不自动绑定':'父实验关系待解析';lineageInfo.append(status);if(item.change_summary){lineageInfo.append(document.createElement('br'),document.createTextNode('修改内容：'+item.change_summary))}}function applyScript(item,preserveName=false){if(!item)return;field('script_id').value=item.id||'';field('script_path').value=item.path||'';field('working_directory').value=item.working_directory||'';field('command').value=item.command||'';if(!preserveName)field('name').value=item.task_name||item.name||'';if(!preserveName||!field('baseline_run_id').value)field('baseline_run_id').value=item.father_run_id||'';if(item.default_batch)batch.value=item.default_batch;if(item.default_gpu_count)field('required_gpu_count').value=item.default_gpu_count;document.getElementById('scriptInfo').textContent='Python：'+(item.python||'—')+'　内置 checkpoint：'+(item.checkpoint||'未识别')+'　数据：'+((item.data_files||[]).join(', ')||'未识别')+'　默认 GPU：'+(item.default_device||'未识别');showLineage(item)}selector.addEventListener('change',()=>applyScript(catalogs.find(x=>x.id===selector.value)));function setInitial(){for(const [key,value] of Object.entries(initial)){const target=field(key);if(target&&value!==null&&value!==undefined){target.value=Array.isArray(value)?value.join(','):value}}if(initial.script_id){selector.value=initial.script_id;applyScript(catalogs.find(x=>x.id===initial.script_id),true)}if(initial.anomaly_policy)policy.value=initial.anomaly_policy}function syncBatchRequirement(){const required=policy.value==='retry_lower_batch';batch.required=required&&!isSweep();batch.placeholder=required?'必填，例如 64':'可留空';batchHint.textContent=required?'必填':'可留空'}function syncQueueMode(){sweepFields.hidden=!isSweep();syncBatchRequirement()}policy.addEventListener('change',syncBatchRequirement);queueMode.addEventListener('change',syncQueueMode);setInitial();syncQueueMode();form.addEventListener('submit',async e=>{e.preventDefault();syncBatchRequirement();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form).entries());if(isSweep()){const batches=document.getElementById('sweepBatches').value.replace(/，/g,',').split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);const scripts=Array.from(sweepScripts.selectedOptions).map(option=>catalogs.find(x=>x.id===option.value)).filter(Boolean);if(!batches.length||!scripts.length){message.textContent='批量扫描必须选择至少一个脚本并填写 batch 组合';return}data.sweep_jobs=[];for(const script of scripts)for(const value of batches)data.sweep_jobs.push({name:(script.task_name||script.name)+'-b'+value,working_directory:script.working_directory,command:script.command,script_id:script.id,script_path:script.path,batch_size:value,required_gpu_count:script.default_gpu_count||data.required_gpu_count,baseline_run_id:script.father_run_id||''});if(data.sweep_jobs.length>50){message.textContent='组合超过 50 条，请缩小范围';return}}message.textContent='正在创建并等待 Agent 预检…';const response=await fetch('/api/v1/web/queue',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(data)});let result={};try{result=await response.json()}catch{}message.textContent=response.ok?'已创建，预检结果将在队列表显示':(response.status===403?'管理员密码错误':result.error||'提交失败');if(response.ok)setTimeout(()=>location.href='/queue',700)});document.querySelectorAll('.queue-action').forEach(button=>button.addEventListener('click',async()=>{const action=button.dataset.action,labels={pause:'完成当前 Epoch 后暂停',resume:'从 checkpoint 恢复',cancel:'取消任务',requeue:'重新排队',requeue_resume:'从 checkpoint 续训',delete:'删除队列记录'};if(action==='delete'&&!confirm('仅删除这条符合条件的队列记录。实验结果、checkpoint 和训练文件不会被删除。确定继续吗？'))return;const password=prompt('请输入管理员密码以'+(labels[action]||'执行操作')+'：');if(password===null)return;const suffix=action==='delete'?'/delete':'/action';const body=action==='delete'?{password}:{password,action};const response=await fetch('/api/v1/web/queue/'+encodeURIComponent(button.dataset.id)+suffix,{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(body)});if(response.ok)location.reload();else{let result={};try{result=await response.json()}catch{}alert(response.status===403?'管理员密码错误':result.error||'操作失败')}}))})();</script></div>'''
+    <script>(()=>{const catalogs=__CATALOG_JSON__,initial=__INITIAL_JSON__,form=document.getElementById('queueForm'),selector=document.getElementById('scriptSelector'),message=document.getElementById('queueMessage'),policy=document.getElementById('queuePolicy'),batch=document.getElementById('queueBatch'),batchHint=document.getElementById('queueBatchHint'),queueMode=document.getElementById('queueMode'),sweepFields=document.getElementById('sweepFields'),sweepScripts=document.getElementById('sweepScripts'),lineageInfo=document.getElementById('lineageInfo');const field=n=>form.elements.namedItem(n),isSweep=()=>queueMode.value==='sweep';function showLineage(item){if(!item||!item.father_yaml_name){lineageInfo.hidden=true;lineageInfo.replaceChildren();return}lineageInfo.hidden=false;lineageInfo.replaceChildren();const title=document.createElement('strong');title.textContent='YAML 继承关系';lineageInfo.append(title,document.createElement('br'),document.createTextNode((item.model_yaml_name||'当前 YAML')+' → '+item.father_yaml_name),document.createElement('br'));const status=document.createElement('span');status.className='label';status.textContent=item.lineage_status==='matched'?'已精确匹配父实验：'+item.father_run_name:item.lineage_status==='run_missing'?'已识别父脚本，但监控库中暂未找到可确认的父实验':item.lineage_status==='parent_ambiguous'?'多个脚本使用同一父 YAML，无法安全地自动确定父实验':item.lineage_status==='parent_script_missing'?'已识别父 YAML，但当前项目中暂未找到对应父脚本':item.lineage_status==='reference_only'?'YAML 注释为“对照”，仅展示且不自动绑定':'父实验关系待解析';lineageInfo.append(status);if(item.change_summary){lineageInfo.append(document.createElement('br'),document.createTextNode('修改内容：'+item.change_summary))}}function applyScript(item,preserveName=false){if(!item)return;field('script_id').value=item.id||'';field('script_path').value=item.path||'';field('working_directory').value=item.working_directory||'';field('command').value=item.command||'';if(!preserveName)field('name').value=item.task_name||item.name||'';if(!preserveName||!field('baseline_run_id').value)field('baseline_run_id').value=item.father_run_id||'';if(item.default_batch)batch.value=item.default_batch;if(item.default_gpu_count)field('required_gpu_count').value=item.default_gpu_count;document.getElementById('scriptInfo').textContent='Python：'+(item.python||'—')+'　内置 checkpoint：'+(item.checkpoint||'未识别')+'　数据：'+((item.data_files||[]).join(', ')||'未识别')+'　默认 GPU：'+(item.default_device||'未识别');showLineage(item)}selector.addEventListener('change',()=>applyScript(catalogs.find(x=>x.id===selector.value)));function setInitial(){for(const [key,value] of Object.entries(initial)){const target=field(key);if(target&&value!==null&&value!==undefined){target.value=Array.isArray(value)?value.join(','):value}}if(initial.script_id){selector.value=initial.script_id;applyScript(catalogs.find(x=>x.id===initial.script_id),true)}if(initial.anomaly_policy)policy.value=initial.anomaly_policy}function syncBatchRequirement(){const required=policy.value==='retry_lower_batch';batch.required=required&&!isSweep();batch.placeholder=required?'必填，例如 64':'可留空';batchHint.textContent=required?'必填':'可留空'}function syncQueueMode(){sweepFields.hidden=!isSweep();syncBatchRequirement()}policy.addEventListener('change',syncBatchRequirement);queueMode.addEventListener('change',syncQueueMode);setInitial();syncQueueMode();form.addEventListener('submit',async e=>{e.preventDefault();syncBatchRequirement();if(!form.reportValidity())return;const data=Object.fromEntries(new FormData(form).entries());if(isSweep()){const batches=document.getElementById('sweepBatches').value.replace(/，/g,',').split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);const scripts=Array.from(sweepScripts.selectedOptions).map(option=>catalogs.find(x=>x.id===option.value)).filter(Boolean);if(!batches.length||!scripts.length){message.textContent='批量扫描必须选择至少一个脚本并填写 batch 组合';return}data.sweep_jobs=[];for(const script of scripts)for(const value of batches)data.sweep_jobs.push({name:(script.task_name||script.name)+'-b'+value,working_directory:script.working_directory,command:script.command,script_id:script.id,script_path:script.path,batch_size:value,required_gpu_count:script.default_gpu_count||data.required_gpu_count,baseline_run_id:script.father_run_id||''});if(data.sweep_jobs.length>50){message.textContent='组合超过 50 条，请缩小范围';return}}message.textContent='正在创建并等待 Agent 预检…';const response=await fetch('/api/v1/web/queue',{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(data)});let result={};try{result=await response.json()}catch{}message.textContent=response.ok?'已创建，预检结果将在队列表显示':(response.status===403?'管理员密码错误':result.error||'提交失败');if(response.ok)setTimeout(()=>location.href='/queue',700)});document.querySelectorAll('.queue-action').forEach(button=>button.addEventListener('click',async()=>{const action=button.dataset.action,labels={pause:'完成当前 Epoch 后暂停',resume:'从 checkpoint 恢复',cancel:'取消任务',requeue:'重新排队',requeue_resume:'从 checkpoint 续训',delete:'删除队列记录'};if(action==='delete'&&!confirm('仅删除这条符合条件的队列记录。实验结果、checkpoint 和训练文件不会被删除。确定继续吗？'))return;const password=prompt('请输入管理员密码以'+(labels[action]||'执行操作')+'：');if(password===null)return;const suffix=action==='delete'?'/delete':'/action';const body=action==='delete'?{password}:{password,action};const response=await fetch('/api/v1/web/queue/'+encodeURIComponent(button.dataset.id)+suffix,{method:'POST',headers:{'Content-Type':'application/json','X-Monitor-Request':'dashboard'},body:JSON.stringify(body)});if(response.ok)location.reload();else{let result={};try{result=await response.json()}catch{}alert(response.status===403?'管理员密码错误':result.error||'操作失败')}}))})();</script></div>'''
     summary = f'<span class="summary-chip">待处理 <strong>{queue_counts["active"]}</strong></span><span class="summary-chip">已完成 <strong>{queue_counts["completed"]}</strong></span><span class="summary-chip">失败 <strong>{queue_counts["failed"]}</strong></span><span class="summary-chip cancelled">已取消 <strong>{queue_counts["cancelled"]}</strong></span>'
-    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__FOLDER_OPTIONS__", folder_options).replace("__HOST_OPTIONS__", host_options).replace("__AGENT_HOST_OPTIONS__", agent_host_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
+    return page("实验队列", template.replace("__FORM_TITLE__", "复制队列任务" if clone_job else "新增队列任务").replace("__FORM_OPEN__", " open" if clone_job else "").replace("__CATALOG_COUNT__", str(len(catalogs))).replace("__CATALOG_OPTIONS__", catalog_options).replace("__BASELINE_OPTIONS__", baseline_options).replace("__FOLDER_OPTIONS__", folder_options).replace("__HOST_OPTIONS__", host_options).replace("__AGENT_HOST_OPTIONS__", agent_host_options).replace("__CATALOG_HOST_COUNT__", str(catalog_host_count)).replace("__HOST_COUNT__", str(host_count)).replace("__SLOT_COUNT__", str(len(agents))).replace("__ACTIVE_COUNT__", str(queue_counts["active"])).replace("__HISTORY_COUNT__", str(queue_counts["completed"] + queue_counts["failed"] + queue_counts["cancelled"])).replace("__AGENT_CARDS__", ''.join(agent_cards) or '<div class="empty">还没有 Agent 上线</div>').replace("__QUEUE_SUMMARY__", summary).replace("__JOB_ROWS__", job_rows_html).replace("__CATALOG_JSON__", json.dumps(catalogs, ensure_ascii=False).replace("</", "<\\/")).replace("__INITIAL_JSON__", json.dumps(initial, ensure_ascii=False).replace("</", "<\\/")))
 
 
 def queue_job_html(job: dict) -> str:
@@ -3512,6 +3576,7 @@ def queue_job_html(job: dict) -> str:
     output_last = html.escape(str(job.get("output_last_checkpoint") or "尚未生成"))
     output_best = html.escape(str(job.get("output_best_checkpoint") or "尚未生成"))
     output_csv = html.escape(str(job.get("output_results_csv") or "尚未生成"))
+    baseline_options = baseline_run_options(str(job.get("baseline_run_id") or ""), str(job.get("run_id") or ""))
     return page("修改队列任务", f'''<div class="wrap">
     <div class="top"><div><a href="/queue">← 返回实验队列</a><div class="brand">{html.escape(job['name'])}</div><div class="muted">任务 ID：{html.escape(job_id)}</div></div><span class="queue-status status-{html.escape(job['status'])}">{html.escape(status_labels.get(job['status'], job['status']))}</span></div>
     <div class="edit-notice"><strong>该任务尚未开始，可以安全修改。</strong> 保存时会再次检查任务状态；如果 Agent 已经领取，服务器将拒绝修改。</div>
@@ -3536,7 +3601,7 @@ def queue_job_html(job: dict) -> str:
       <label><span>初始 batch <span id="editQueueBatchHint" class="label">可留空</span></span><input id="editQueueBatch" name="batch_size" type="number" min="1" class="filter-input" value="{html.escape(batch_size)}"></label>
       <label>最小 batch<input name="min_batch_size" type="number" min="1" class="filter-input" value="{job['min_batch_size']}"></label>
       <label class="form-wide">断点 checkpoint<input name="resume_checkpoint" class="filter-input" maxlength="1000" value="{html.escape(job.get('resume_checkpoint') or '')}" placeholder="可选 last.pt 绝对路径"></label>
-      <label>基线 Run ID<input name="baseline_run_id" class="filter-input" maxlength="80" value="{html.escape(job.get('baseline_run_id') or '')}"></label>
+       <details class="form-wide"><summary>对比基线（可选）</summary><label>选择父实验<select name="baseline_run_id" class="filter-input">{baseline_options}</select></label></details>
       <label>管理员密码<input name="password" type="password" class="filter-input" autocomplete="current-password" required></label>
       <label class="form-wide">任务备注<textarea name="notes" class="filter-input" maxlength="8000">{html.escape(job.get('notes') or '')}</textarea></label>
       <div class="form-wide controls"><button class="button" type="submit">保存修改</button><a class="button secondary" href="/queue">放弃并返回</a><span id="editMessage" class="muted"></span></div>
@@ -3569,8 +3634,9 @@ def run_html(run: dict, events: list[dict]) -> str:
         status = str(lineage.get("lineage_status") or "none")
         status_text = {
             "matched": f'已精确匹配父 Run：{lineage.get("father_run_name") or ""}（{lineage.get("father_run_id") or ""}）',
-            "run_missing": "已识别父脚本，但监控库中暂未找到实验名完全一致的父 Run；未进行模糊绑定。",
-            "parent_script_missing": "已识别父 YAML，但 Agent 目录中暂未找到对应父脚本。",
+            "run_missing": "已识别父脚本，但监控库中暂未找到可确认的父实验；未进行模糊绑定。",
+            "parent_ambiguous": "多个脚本使用同一父 YAML，无法安全地自动确定父实验。",
+            "parent_script_missing": "已识别父 YAML，但当前项目中暂未找到对应父脚本。",
             "parent_name_missing": "父脚本存在，但未能读取其实验名。",
             "reference_only": "YAML 注释为“对照”而非“父实验”，仅展示且不自动绑定。",
         }.get(status, "尚未识别到可自动绑定的父 Run。")
@@ -3606,12 +3672,13 @@ def run_html(run: dict, events: list[dict]) -> str:
     <div id="aiMessage" class="muted">{html.escape(ai_message)}</div>
     <pre id="aiReport" class="log-tail" style="max-height:none;display:{'block' if ai_report else 'none'}">{html.escape(ai_report)}</pre>
     <div id="aiEmpty" class="empty" style="display:{'none' if ai_report else 'block'}">配置模型后可自动或手动生成详细结论。</div></div>'''
-    metadata_fields = ("hypothesis", "change_notes", "result_notes", "conclusion", "next_step", "baseline_run_id")
+    metadata_fields = ("hypothesis", "change_notes", "result_notes", "conclusion", "next_step")
     metadata_complete = sum(1 for field in metadata_fields if str(run.get(field) or "").strip())
     display_code, display_subtitle = experiment_display_name(run["name"])
+    baseline_options = baseline_run_options(str(run.get("baseline_run_id") or ""), run["id"])
     best_map, _ = best_core_metric(events, "mAP50-95")
     environment = environment_brief(run.get("parameters") or {})
-    return page(run["name"], f"""<div class="wrap"><div class="top"><div><a href="/">← 实验总览</a><div class="page-eyebrow">Experiment detail</div><div class="brand" title="{html.escape(run['name'])}">{html.escape(display_code)}</div><div class="page-subtitle">{html.escape(display_subtitle or run['name'])}</div><div class="muted"><span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span></div></div><div class="top-actions">{clone_button}<a class="button secondary" href="/lineage">实验谱系</a><div id="statusBadge">{status_badge(run['status'])}</div><a class="button secondary" href="/logout">退出登录</a></div></div>
+    return page(run["name"], f"""<div class="wrap"><div class="top"><div><a href="/">← 实验总览</a><div class="page-eyebrow">Experiment detail</div><div class="brand" title="{html.escape(run['name'])}">{html.escape(display_code)}</div><div class="page-subtitle">{html.escape(display_subtitle or run['name'])}</div><div class="muted">Run {html.escape(run['id'])} · <span id="liveDot" class="live-dot"></span><span id="liveText">实时连接中</span></div></div><div class="top-actions">{clone_button}<a class="button secondary" href="/lineage">实验谱系</a><div id="statusBadge">{status_badge(run['status'])}</div><a class="button secondary" href="/logout">退出登录</a></div></div>
     <div class="panel detail-hero"><div class="detail-kpis"><div class="detail-kpi"><div class="label">Epoch</div><div id="epochValue" class="value">{run['current_epoch']} / {total}</div></div><div class="detail-kpi"><div class="label">Best mAP50-95</div><div id="bestMapValue" class="value">{percentage(best_map)}</div></div><div class="detail-kpi"><div class="label">vs Baseline</div><div id="baselineDeltaValue" class="value">{baseline_delta_html(run, best_map)}</div></div><div class="detail-kpi"><div class="label">ETA</div><div id="etaValue" class="value">{human_duration(run.get('eta_seconds'))}</div></div></div><div class="bar"><div id="progressFill" class="fill" style="width:{pct:.1f}%"></div></div><div class="detail-meta"><span>Batch <strong id="batchValue">{run.get('current_batch') or '—'} / {run.get('total_batches') or '—'}</strong></span><span>已运行 <strong id="elapsedValue">{human_duration(run.get('elapsed_seconds'))}</strong></span><span id="environmentBrief">{html.escape(environment)}</span></div></div>
     <div id="dynamicError" class="panel" style="display:{'block' if run.get('error_message') else 'none'}"><h3>错误信息</h3><pre id="dynamicErrorText">{html.escape(run.get('error_message') or '')}</pre></div>
     <nav class="tab-list" role="tablist" aria-label="实验详情"><button class="tab-button" type="button" role="tab" data-tab="overview" aria-selected="true">总览</button><button class="tab-button" type="button" role="tab" data-tab="metrics" aria-selected="false">指标曲线</button><button class="tab-button" type="button" role="tab" data-tab="resources" aria-selected="false">资源监控</button><button class="tab-button" type="button" role="tab" data-tab="logs" aria-selected="false">日志</button><button class="tab-button" type="button" role="tab" data-tab="environment" aria-selected="false">配置环境</button><button class="tab-button" type="button" role="tab" data-tab="artifacts" aria-selected="false">产物</button><button class="tab-button" type="button" role="tab" data-tab="notes" aria-selected="false">实验记录</button></nav>
@@ -3619,9 +3686,9 @@ def run_html(run: dict, events: list[dict]) -> str:
     <section class="tab-panel" id="tab-metrics" role="tabpanel" hidden>{chart}<div class="panel"><h3>最佳 Epoch</h3><div id="bestEpoch">{best_epoch_html(best)}</div><details><summary>查看全部最新/最终原始指标</summary><div id="latestMetrics">{metric_chips(latest_metrics)}</div></details></div></section>
     <section class="tab-panel" id="tab-resources" role="tabpanel" hidden><div class="panel"><h3>GPU / 主机状态</h3><div id="hostStatus">{host_status_html(run.get('host_status') or {})}</div></div></section>
     <section class="tab-panel" id="tab-logs" role="tabpanel" hidden><div class="panel"><h3>实时日志尾部</h3><div class="muted">SSE 实时更新；保留最近约 12,000 个字符。</div><pre id="logTail" class="log-tail">{log_text}</pre></div></section>
-    <section class="tab-panel" id="tab-environment" role="tabpanel" hidden><div class="panel"><details><summary><strong>可复现信息</strong> · {html.escape(environment)}</summary><div id="reproducibility">{reproducibility_html(run.get('parameters') or {})}</div></details></div>{lineage_panel}<div class="panel"><h3>相对基线的模型配置差异</h3><pre>{html.escape(summary.get('config_diff') or '设置基线 Run ID 且新旧实验都上传模型 YAML 后，将自动显示逐行差异。')}</pre></div></section>
+    <section class="tab-panel" id="tab-environment" role="tabpanel" hidden><div class="panel"><details><summary><strong>可复现信息</strong> · {html.escape(environment)}</summary><div id="reproducibility">{reproducibility_html(run.get('parameters') or {})}</div></details></div>{lineage_panel}<div class="panel"><h3>相对基线的模型配置差异</h3><pre>{html.escape(summary.get('config_diff') or '识别到明确父实验且两次实验都上传模型 YAML 后，将显示逐行差异。')}</pre></div></section>
     <section class="tab-panel" id="tab-artifacts" role="tabpanel" hidden>{artifact_panel or '<div class="panel"><p class="muted">实验尚未上报输出目录。</p></div>'}<div class="panel"><h3>结果信息</h3><div id="resultMetrics">{metric_chips(run['result'])}</div></div></section>
-    <section class="tab-panel" id="tab-notes" role="tabpanel" hidden><div class="panel"><div class="panel-heading"><h3>实验记录与标签</h3><span class="summary-chip">核心记录完整度 <strong>{metadata_complete} / {len(metadata_fields)}</strong></span></div><form id="metadataForm" class="notes-grid"><label><span class="label">分组</span><input id="groupName" class="filter-input" maxlength="80" value="{html.escape(run.get('group_name') or '')}" placeholder="例如 DroneVehicle"></label><label><span class="label">标签（逗号分隔）</span><input id="tagsInput" class="filter-input" value="{html.escape(', '.join(run.get('tags') or []))}" placeholder="PaperLAF, FP32Safe, baseline"></label><label class="controls"><input id="favoriteInput" type="checkbox" {'checked' if run.get('favorite') else ''}>收藏</label><label><span class="label">Hypothesis · 实验假设</span><textarea id="hypothesis" class="filter-input" placeholder="为什么做这个实验？预期哪些指标会改善？">{html.escape(run.get('hypothesis') or '')}</textarea></label><label><span class="label">Modification · 修改内容</span><textarea id="changeNotes" class="filter-input" placeholder="与父实验相比只改了什么？">{html.escape(run.get('change_notes') or '')}</textarea></label><label><span class="label">Conclusion · 结论</span><textarea id="conclusion" class="filter-input" placeholder="训练结束后填写结论">{html.escape(run.get('conclusion') or '')}</textarea></label><label><span class="label">结果记录</span><textarea id="resultNotes" class="filter-input">{html.escape(run.get('result_notes') or '')}</textarea></label><label><span class="label">下一步</span><textarea id="nextStep" class="filter-input">{html.escape(run.get('next_step') or '')}</textarea></label><label><span class="label">基线 Run ID</span><input id="baselineRunId" class="filter-input" maxlength="80" value="{html.escape(run.get('baseline_run_id') or '')}" placeholder="仅对显式父实验自动绑定"></label><label><span class="label">管理员密码</span><input id="metadataPassword" class="filter-input" type="password" autocomplete="current-password" required></label><div class="controls wide"><button class="button" type="submit">保存实验记录</button><span id="metadataMessage" class="muted">系统只补空字段，不覆盖人工内容。</span></div></form></div>{ai_panel}
+    <section class="tab-panel" id="tab-notes" role="tabpanel" hidden><div class="panel"><div class="panel-heading"><h3>实验记录与标签</h3><span class="summary-chip">核心记录完整度 <strong>{metadata_complete} / {len(metadata_fields)}</strong></span></div><form id="metadataForm" class="notes-grid"><label><span class="label">分组</span><input id="groupName" class="filter-input" maxlength="80" value="{html.escape(run.get('group_name') or '')}" placeholder="例如 DroneVehicle"></label><label><span class="label">标签（逗号分隔）</span><input id="tagsInput" class="filter-input" value="{html.escape(', '.join(run.get('tags') or []))}" placeholder="PaperLAF, FP32Safe, baseline"></label><label class="controls"><input id="favoriteInput" type="checkbox" {'checked' if run.get('favorite') else ''}>收藏</label><label><span class="label">Hypothesis · 实验假设</span><textarea id="hypothesis" class="filter-input" placeholder="为什么做这个实验？预期哪些指标会改善？">{html.escape(run.get('hypothesis') or '')}</textarea></label><label><span class="label">Modification · 修改内容</span><textarea id="changeNotes" class="filter-input" placeholder="与父实验相比只改了什么？">{html.escape(run.get('change_notes') or '')}</textarea></label><label><span class="label">Conclusion · 结论</span><textarea id="conclusion" class="filter-input" placeholder="训练结束后填写结论">{html.escape(run.get('conclusion') or '')}</textarea></label><label><span class="label">结果记录</span><textarea id="resultNotes" class="filter-input">{html.escape(run.get('result_notes') or '')}</textarea></label><label><span class="label">下一步</span><textarea id="nextStep" class="filter-input">{html.escape(run.get('next_step') or '')}</textarea></label><details class="form-wide"><summary>对比基线（可选）</summary><label>选择父实验<select id="baselineRunId" class="filter-input">{baseline_options}</select></label></details><label><span class="label">管理员密码</span><input id="metadataPassword" class="filter-input" type="password" autocomplete="current-password" required></label><div class="controls wide"><button class="button" type="submit">保存实验记录</button><span id="metadataMessage" class="muted">系统只补空字段，不覆盖人工内容。</span></div></form></div>{ai_panel}
     <details class="panel danger-zone"><summary>危险区域 · 删除实验记录</summary><div><p class="muted">删除将永久移除实验及全部指标。需要输入下面显示的实验编号和管理员密码。</p><form id="deleteRunForm" method="post" action="/runs/{quote(run['id'])}/delete"><label>输入 <strong>{html.escape(display_code)}</strong> 确认<br><input class="confirm-name" name="confirm_name" autocomplete="off" required></label><label>管理员密码<br><input type="password" name="password" autocomplete="current-password" required></label><button class="button danger" type="submit">永久删除</button></form></div></details></section>
     <script>
     (()=>{{const runId={json.dumps(run['id'])},duration=value=>{{if(value===null||value===undefined)return '—';let s=Math.max(0,Math.floor(Number(value)||0)),h=Math.floor(s/3600);s%=3600;const m=Math.floor(s/60);s%=60;return h?(h+'小时 '+m+'分'):(m?(m+'分 '+s+'秒'):(s+'秒'))}};
