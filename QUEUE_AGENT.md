@@ -41,6 +41,12 @@ Agent 服务固定从 `/opt/yolo-monitor-agent` 启动；每个实验仍会切�
 
 把本包的 `client/yolo_monitor.py` 更新到训练项目实际导入的监控模块。Agent 会设置 `YOLO_QUEUE_CONTROL_FILE`；点击“完成当前 Epoch 后暂停”后，每个 DDP rank 会在同一个 Epoch 边界设置 `trainer.stop`，随后使用最新 `last.pt` 恢复。
 
+### 现有单卡训练脚本的轻量接入
+
+将 `client/monitored_training.py` 和 `client/yolo_monitor.py` 放在训练脚本的同级目录。训练脚本只需导入 `agent_device, train_with_monitor`，在解析设备参数后调用 `agent_device(args.device, single_gpu=True)`（只支持单卡的脚本），最后将 `model.train(trainer=trainer, **train_args)` 改为 `train_with_monitor(model, trainer=trainer, **train_args)`。当 `trainer` 为 `None` 时，适配层仍按原来的无自定义 Trainer 路径调用；它不会修改 Trainer 类或训练参数。
+
+手动运行且没有 `YOLO_MONITOR_URL` / `YOLO_MONITOR_TOKEN` 时训练行为保持原样，不会自动上传；队列 Agent 会自动注入这两个环境变量以及 Run ID。该轻量适配层用于单卡实时上报。Ultralytics 自动 DDP 的子进程会重新导入 Trainer，函数内定义的自定义 Trainer 无法由生成的 DDP 脚本导入；这类实验要获得实时 Epoch 上报仍需使用可导入的监控 Trainer 类，不应假装父进程回调已覆盖子进程。
+
 Agent 将 PID、任务、日志位置和读取偏移保存在 `state_file`。systemd 使用 `KillMode=process`，因此只重启 Agent 不会杀死训练子进程；新 Agent 会校验 `/proc/<pid>/environ` 中的任务 ID 后重新接管。若进程已经消失，会先读取服务器上的 Run 完成状态；服务器尚未确认完成且已绑定输出目录时，再核验对应的 `results.csv`、日志和 checkpoint。确认训练已完成时直接清理旧状态，不发送“进程消失”异常；未完成时，有 `last.pt` 的任务转为“已暂停”等待人工恢复，没有 checkpoint 则标记失败。服务器还会阻止旧版 Agent 将已完成 Run 错误回退为暂停，并在发送恢复异常邮件前再次核对完成状态。
 
 `worker_slots` 控制同一训练机可同时管理多少个独立任务。第一个槽位沿用 `agent_id` 和 `state_file`，其余槽位自动使用 `agent_id-slot-N` 与 `agent-state.slot-N.json`，所以每个任务的恢复状态互不覆盖。

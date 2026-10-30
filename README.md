@@ -57,11 +57,13 @@ desktop/
   build.ps1                         使用系统 C# 编译器生成 EXE
 client/
   yolo_monitor.py                   Ultralytics 回调及异常包装器
+  monitored_training.py             保留原 Trainer 的单卡训练接入层
   train_example.py                  最小接入示例
   monitored_target_saliency_trainer.py  可被 DDP 子进程重新导入的监控 Trainer
   train_dronevehicle_ddp_fixed.py   DroneVehicle 双卡修复示例
 tests/
   test_smoke.py                     本地端到端冒烟测试
+  test_monitored_training.py        轻量接入层的 Trainer 与 GPU 分配测试
 ```
 
 ## 安全边界
