@@ -145,6 +145,28 @@ class QueueUiTest(unittest.TestCase):
         self.assertIn('option.dataset.hostname===host.value', page)
         self.assertNotIn('__HOST_OPTIONS__', page)
 
+    def test_reconciliation_stays_on_the_job_training_host(self):
+        store = self.server.Store(str(Path(self.temp.name) / "host-reconciliation.db"))
+        store.heartbeat_agent({"agent_id": "old-slot", "hostname": "old-host", "gpus": []})
+        store.heartbeat_agent({"agent_id": "new-slot", "hostname": "new-host", "gpus": []})
+        job = store.create_queue_job({
+            "name": "old-experiment", "command": "python train.py",
+            "working_directory": "/project", "target_hostname": "old-host",
+        })
+        store.start_run({"run_id": job["run_id"], "name": job["name"], "total_epochs": 10})
+        output_dir = "/project/out"
+        with store.connect() as conn:
+            conn.execute("UPDATE queue_jobs SET status='failed',output_dir=?,output_results_csv=? WHERE id=?",
+                         (output_dir, output_dir + "/results.csv", job["id"]))
+            conn.execute("UPDATE runs SET status='stalled' WHERE id=?", (job["run_id"],))
+
+        self.assertEqual(store.reconciliation_jobs("new-slot"), [])
+        with self.assertRaisesRegex(PermissionError, "another training host"):
+            store.reconcile_job(job["id"], {
+                "agent_id": "new-slot", "output_dir": output_dir, "epochs": [], "evidence": {},
+            })
+        self.assertEqual([item["id"] for item in store.reconciliation_jobs("old-slot")], [job["id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

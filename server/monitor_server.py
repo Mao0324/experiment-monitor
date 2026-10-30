@@ -1842,18 +1842,21 @@ class Store:
             return []
         cutoff = datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat(timespec="seconds")
         with self.connect() as conn:
+            agent = conn.execute("SELECT hostname FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent:
+                return []
             rows = conn.execute(
                 """SELECT q.id,q.run_id,q.output_dir,q.output_results_csv,
                 q.output_last_checkpoint,q.output_best_checkpoint,q.runtime_pid,
                 r.total_epochs FROM queue_jobs q JOIN runs r ON r.id=q.run_id
-                WHERE q.output_dir!='' AND q.status!='cancelled'
+                WHERE q.target_hostname=? AND q.output_dir!='' AND q.status!='cancelled'
                 AND (q.reconcile_requested_at IS NULL OR q.reconcile_requested_at<?)
                 AND (r.status IN ('stalled','failed') OR
                      (q.status='failed' AND r.status='completed') OR
                      (q.status='paused' AND q.last_error='Agent 重启后发现原训练进程已经消失') OR
                      (SELECT COUNT(DISTINCT e.epoch) FROM metric_events e
                       WHERE e.run_id=r.id AND e.phase='epoch')<r.current_epoch)
-                ORDER BY q.updated_at DESC LIMIT 1""", (cutoff,),
+                ORDER BY q.updated_at DESC LIMIT 1""", (agent["hostname"], cutoff),
             ).fetchall()
             for row in rows:
                 conn.execute("UPDATE queue_jobs SET reconcile_requested_at=? WHERE id=?", (utc_now(), row["id"]))
@@ -1861,7 +1864,8 @@ class Store:
 
     def reconcile_job(self, job_id: str, payload: dict) -> dict | None:
         agent_id = str(payload.get("agent_id") or "")[:120]
-        if not self.get_agent(agent_id):
+        agent = self.get_agent(agent_id)
+        if not agent:
             raise PermissionError("agent must heartbeat before reconciliation")
         rows = payload.get("epochs") or []
         if not isinstance(rows, list) or len(rows) > 50:
@@ -1873,6 +1877,8 @@ class Store:
             job = conn.execute("SELECT * FROM queue_jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
                 return None
+            if job["target_hostname"] != agent["hostname"]:
+                raise PermissionError("job targets another training host")
             run = conn.execute("SELECT * FROM runs WHERE id=?", (job["run_id"],)).fetchone()
             if not run or not job["output_dir"] or str(payload.get("output_dir") or "") != job["output_dir"]:
                 raise ValueError("output binding mismatch")

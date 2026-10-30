@@ -35,8 +35,8 @@ class ReconciliationTest(unittest.TestCase):
         now = module.utc_now()
         with self.store.connect() as conn:
             conn.execute("INSERT INTO runs(id,name,status,total_epochs,current_epoch,started_at,updated_at) VALUES ('run','test','stalled',3,1,?,?)", (now, now))
-            conn.execute("""INSERT INTO queue_jobs(id,name,status,command_text,working_directory,run_id,created_at,updated_at,output_dir,output_results_csv)
-                         VALUES ('job','test','failed','python train.py','/tmp','run',?,?, '/tmp/output','/tmp/output/results.csv')""", (now, now))
+            conn.execute("""INSERT INTO queue_jobs(id,name,status,command_text,working_directory,target_hostname,run_id,created_at,updated_at,output_dir,output_results_csv)
+                         VALUES ('job','test','failed','python train.py','/tmp','host','run',?,?, '/tmp/output','/tmp/output/results.csv')""", (now, now))
             conn.execute("INSERT INTO agents(id,hostname,updated_at) VALUES ('worker','host',?)", (now,))
 
     def report(self, completed):
