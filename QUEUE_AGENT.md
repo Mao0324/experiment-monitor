@@ -32,7 +32,7 @@ Agent 服务固定从 `/opt/yolo-monitor-agent` 启动；每个实验仍会切�
 - 一个 Agent 可配置多个 `allowed_roots`。例如保留旧项目 `/media/biiteam/新加卷1/biiteam/MCONG/Yolov8_TwoStream`，再加入 `/data1/MCONG/TwoStream_Yolov8`；`train*.py` 会扫描新项目根目录的训练入口，原有 `train/*/train_*.py` 模式仍扫描旧项目的分类子目录。
 - 网页新增任务先选 Agent 已扫描的项目文件夹，再从该文件夹内搜索脚本；选择脚本后填写工作目录和启动命令。手动填写仍可用于尚未纳入扫描的脚本。
 - 多台训练机接入后，新增任务先选“目标训练机”，再选这台机器的项目文件夹和脚本。服务器只把预检和任务领取派给所选主机；多个 Worker Slot 可以在同一台主机内分配 GPU。已有单机队列任务在升级时自动保留原主机，不会被新机器抢走。队列列表也可按训练机筛选；未开始的任务可编辑目标训练机，改动后重新预检。
-- 每台训练机应使用独立的 `agent_id`、本机存在的 `allowed_roots` 和本机 Python 路径。服务单元的 `User` 与 `ExecStart` 必须按该主机调整；例如 Ubuntu 20.04 系统 Python 3.8 不能运行当前 Agent，应使用 Python 3.9 或更新版本。不要把 API token 写进仓库。
+- 每台训练机应使用独立的 `agent_id` 和主机名、本机存在的 `allowed_roots` 和本机 Python 路径。任务按 Agent 上报的主机名路由，同名主机会被视为同一台机器。服务单元的 `User` 与 `ExecStart` 必须按该主机调整；例如 Ubuntu 20.04 系统 Python 3.8 不能运行当前 Agent，应使用 Python 3.9 或更新版本。若 Conda Python 报 HTTPS 证书链错误，可在该服务单元中设置 `Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`，不要关闭证书校验。不要把 API token 写进仓库。
 
 - 新任务必须先通过无 GPU 预检：路径白名单、Python/脚本/checkpoint/data/model 文件、磁盘空间，以及在 `CUDA_VISIBLE_DEVICES=""` 下导入 PyTorch 和 Ultralytics。
 - 批量消融按“脚本 × batch”生成队列任务，单次最多 50 条。
