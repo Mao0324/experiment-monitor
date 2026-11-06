@@ -665,16 +665,16 @@ class YoloExperimentMonitor:
         owner.add_callback("on_train_end", self.on_train_end)
         return self
 
-    def train(self, model, **train_args):
+    def train(self, yolo_model, **train_args):
         """Attach callbacks, train, and report exceptions before re-raising them."""
-        self.attach(model)
-        self._extra_parameters["model_config"] = _model_configuration(model)
+        self.attach(yolo_model)
+        self._extra_parameters["model_config"] = _model_configuration(yolo_model)
         # Create the run before Ultralytics initializes datasets/devices so even an
         # early configuration error can be reported as a failed experiment.
         name = self.experiment_name or str(train_args.get("name") or f"YOLO-{self.run_id[:8]}")
         self.start(int(train_args.get("epochs") or 0), train_args, name)
         try:
-            return model.train(**train_args)
+            return yolo_model.train(**train_args)
         except BaseException as exc:
             trace = traceback.format_exc()
             try:

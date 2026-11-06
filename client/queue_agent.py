@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -88,7 +89,18 @@ class Agent:
         self.catalog: list[dict] = []
         self.catalog_at = 0.0
         self.reconcile_at: dict[str, float] = {}
+        self.test_profiles = {
+            str(item["id"]): item for item in (config.get("test_profiles") or [])
+            if isinstance(item, dict) and item.get("id") and item.get("script")
+        }
+        self.current_test: dict | None = None
+        self.test_process: subprocess.Popen | None = None
+        self.test_pid = 0
+        self.test_stage = ""
+        self.test_report: dict | None = None
+        self.test_state_path = self.state_path.with_name(self.state_path.stem + ".test.json")
         self._load_state()
+        self._load_test_state()
 
     def request(self, path: str, payload: dict) -> dict:
         request = Request(
@@ -135,6 +147,36 @@ class Agent:
 
     def control_path(self, job: dict) -> Path:
         return self.log_dir / f"{job['id']}.control.json"
+
+    def test_log_path(self, test: dict) -> Path:
+        return self.log_dir / f"test-{test['id']}.log"
+
+    def _write_test_state(self):
+        value = {"test": self.current_test, "pid": self.test_pid, "stage": self.test_stage,
+                 "report": self.test_report} if self.current_test else {}
+        temporary = self.test_state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.test_state_path)
+
+    def _load_test_state(self):
+        try:
+            value = json.loads(self.test_state_path.read_text(encoding="utf-8"))
+            test = value.get("test")
+            if isinstance(test, dict) and test.get("id"):
+                self.current_test = test
+                self.test_pid = int(value.get("pid") or 0)
+                self.test_stage = str(value.get("stage") or "")
+                self.test_report = value.get("report") if isinstance(value.get("report"), dict) else None
+        except (OSError, ValueError, TypeError):
+            return
+
+    def test_process_matches(self, pid: int, test_id: str) -> bool:
+        if not self.process_alive(pid):
+            return False
+        try:
+            return f"YOLO_TEST_REQUEST_ID={test_id}".encode() in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            return False
 
     @staticmethod
     def process_alive(pid: int) -> bool:
@@ -475,12 +517,20 @@ class Agent:
                 pass
         response = self.request("/api/v1/agents/heartbeat", {
             "agent_id": self.agent_id, "hostname": self.hostname,
-            "state": "running" if self.current_job and self.current_pid else "idle",
+            "state": "testing" if self.current_test else "running" if self.current_job and self.current_pid else "idle",
             "current_job_id": (self.current_job or {}).get("id", ""), "gpus": gpus,
+            "current_test_id": (self.current_test or {}).get("id", ""),
+            "test_profiles": [
+                {"id": profile_id, "label": str(profile.get("label") or profile_id),
+                 "run_prefixes": profile.get("run_prefixes") or [],
+                 "supports_incomplete": bool(profile.get("args_incomplete"))}
+                for profile_id, profile in self.test_profiles.items()
+            ],
             "idle_reminder_seconds": int(self.config.get("idle_reminder_seconds", 1800)),
             "idle_reminder_gpu_count": int(self.config.get("idle_reminder_gpu_count", 1)),
             "catalog": self.catalog,
             "capabilities": {"preflight": True, "safe_pause": True, "restart_recovery": True,
+                             "test_v1": True,
                              "reconcile_v1": True, "gpu_cuda_probe": True, "version": "2.0",
                              "idle_utilization_percent": self.idle_utilization, "idle_memory_used_mb": self.idle_memory_used,
                              "current_log_age_seconds": log_age},
@@ -571,6 +621,182 @@ class Agent:
     def claim(self, gpus: list[dict]) -> dict | None:
         usable = [gpu for gpu in gpus if gpu.get("cuda_usable") is not False and gpu.get("telemetry_usable") is not False]
         return self.request("/api/v1/agents/claim", {"agent_id": self.agent_id, "gpus": usable}).get("job")
+
+    def claim_test(self, gpus: list[dict]) -> dict | None:
+        return self.request("/api/v1/agents/tests/claim", {"agent_id": self.agent_id, "gpus": gpus}).get("test")
+
+    def update_test(self, test: dict, status: str, **values) -> dict:
+        return self.request(f"/api/v1/agents/tests/{test['id']}/status", {
+            "agent_id": self.agent_id, "status": status, **values,
+        }).get("test") or {}
+
+    def _test_command(self, test: dict) -> tuple[Path, list[str]]:
+        profile = self.test_profiles.get(test["profile_id"])
+        if not profile:
+            raise ValueError("test profile is no longer configured")
+        run_dir = Path(test["run_dir"]).expanduser().resolve()
+        prefixes = [Path(value).expanduser().resolve() for value in profile.get("run_prefixes", [])]
+        if not run_dir.is_dir() or not self.within_allowed_root(run_dir) or run_dir.parent not in prefixes:
+            raise ValueError("test run directory is outside the configured dataset directory")
+        script = Path(profile["script"]).expanduser().resolve()
+        if not script.is_file() or not self.within_allowed_root(script):
+            raise ValueError("test script is missing or outside allowed_roots")
+        if not Path(self.training_python).is_file():
+            raise ValueError("configured training_python does not exist")
+        checkpoint = run_dir / "weights" / "best.pt"
+        if not checkpoint.is_file():
+            raise ValueError("best.pt is missing for this test")
+        arguments = profile.get("args_complete" if test["retain_results"] else "args_incomplete")
+        if not isinstance(arguments, list) or not arguments or not all(isinstance(item, str) for item in arguments):
+            raise ValueError("test profile has no command for this run state")
+        if not any("{run_dir}" in item for item in arguments):
+            raise ValueError("test profile must pass the assigned experiment directory")
+        if not test["retain_results"] and "--save-metrics" in arguments:
+            raise ValueError("incomplete test profile must not save metrics in the run directory")
+        if not test["retain_results"]:
+            required_bytes = checkpoint.stat().st_size
+            if shutil.disk_usage(run_dir).free < required_bytes + 1024 ** 3:
+                raise ValueError("not enough free disk space for an isolated test checkpoint")
+            stage = Path(tempfile.mkdtemp(prefix=f".monitor-test-{test['id']}-", dir=run_dir.parent))
+            self.test_stage = str(stage)
+            if self.current_test:
+                self._write_test_state()
+            for filename in ("args.yaml", "data.yaml", "experiment.yaml", "model.yaml", "initializer.build.json"):
+                source = run_dir / filename
+                if source.is_file():
+                    shutil.copy2(source, stage / filename)
+            (stage / "weights").mkdir()
+            shutil.copy2(checkpoint, stage / "weights" / "best.pt")
+            experiment_dir = stage
+        else:
+            experiment_dir = run_dir
+        values = {"run_dir": str(experiment_dir),
+                  "checkpoint": str(experiment_dir / "weights" / "best.pt")}
+        try:
+            command = [self.training_python, str(script)] + [item.format_map(values) for item in arguments]
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"invalid test profile placeholder: {exc}") from exc
+        return Path(profile.get("working_directory") or script.parent).expanduser().resolve(), command
+
+    def _cleanup_test_stage(self, test: dict):
+        if not self.test_stage:
+            return
+        stage = Path(self.test_stage)
+        run_dir = Path(test["run_dir"]).expanduser().resolve()
+        if not (stage.parent.resolve() == run_dir.parent and not stage.is_symlink()
+                and stage.name.startswith(f".monitor-test-{test['id']}-")):
+            raise ValueError("refusing to remove an unexpected test stage path")
+        if stage.exists():
+            shutil.rmtree(stage)
+        self.test_stage = ""
+
+    def _test_metrics(self, log_text: str) -> dict:
+        log_text = log_text.replace("\r\n", "\n")
+        marker = "metrics:\n"
+        position = log_text.rfind("\n" + marker)
+        yaml_text = log_text[position + 1:] if position >= 0 else log_text if log_text.startswith(marker) else ""
+        if not yaml_text:
+            return {}
+        lines = [marker.rstrip("\n")]
+        for line in yaml_text.splitlines()[1:]:
+            if line and not line[0].isspace():
+                break
+            lines.append(line)
+        try:
+            result = subprocess.run(
+                [self.training_python, "-c", "import json,sys,yaml; print(json.dumps(yaml.safe_load(sys.stdin.read())['metrics']))"],
+                input="\n".join(lines), capture_output=True, text=True, timeout=15,
+            )
+            value = json.loads(result.stdout) if result.returncode == 0 else {}
+            return {str(key)[:120]: number for key, number in value.items()
+                    if isinstance(number, (int, float)) and math.isfinite(number)} if isinstance(value, dict) else {}
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            return {}
+
+    def run_test(self, test: dict):
+        self.current_test = test
+        log_path = self.test_log_path(test)
+        try:
+            if self.test_report:
+                self.update_test(test, **self.test_report)
+                self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
+                self._write_test_state()
+                return
+            if not self.test_pid:
+                self._cleanup_test_stage(test)
+                self._write_test_state()
+                cwd, command = self._test_command(test)
+                if not cwd.is_dir() or not self.within_allowed_root(cwd):
+                    raise ValueError("test working directory is outside allowed_roots")
+                env = os.environ.copy()
+                env.update({"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": str(test["assigned_gpu"]),
+                            "YOLO_TEST_REQUEST_ID": test["id"]})
+                with log_path.open("wb", buffering=0) as log:
+                    self.test_process = subprocess.Popen(command, cwd=str(cwd), env=env,
+                                                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                self.test_pid = self.test_process.pid
+                self._write_test_state()
+                self.update_test(test, "running")
+            while not self.stop_requested:
+                if self.test_process is not None:
+                    if self.test_process.poll() is not None:
+                        break
+                elif not self.test_process_matches(self.test_pid, test["id"]):
+                    break
+                self.heartbeat(self.gpu_status())
+                time.sleep(self.poll_seconds)
+            if self.stop_requested and self.test_process_matches(self.test_pid, test["id"]):
+                self._write_test_state()
+                return
+            exit_code = self.test_process.poll() if self.test_process is not None else None
+            with log_path.open("rb") as log:
+                log.seek(max(0, log.seek(0, os.SEEK_END) - 64000))
+                log_text = log.read().decode("utf-8", errors="replace")
+            result_path = ""
+            if test["retain_results"]:
+                matches = re.findall(r"Metrics saved to (.+\.yaml)\s*$", log_text, re.M)
+                if matches:
+                    result = Path(matches[-1]).expanduser().resolve()
+                    run_dir = Path(test["run_dir"]).expanduser().resolve()
+                    if result.is_file() and result.is_relative_to(run_dir / "test"):
+                        result_path = str(Path(test["run_dir"]) / result.relative_to(run_dir))
+            metrics = self._test_metrics(log_text)
+            result_evidence = bool(result_path or (not test["retain_results"] and metrics))
+            last_metrics_at = log_text.rfind("\nmetrics:\n")
+            later_traceback = last_metrics_at >= 0 and "Traceback (most recent call last)" in log_text[last_metrics_at:]
+            success = (exit_code == 0 and result_evidence) or (
+                exit_code is None and result_evidence and not later_traceback
+            )
+            status = "completed" if success else "failed"
+            error = "" if status == "completed" else (
+                f"test exited with code {exit_code}" if exit_code is not None
+                else "Agent restarted before the test exit code could be verified"
+            )
+            self._cleanup_test_stage(test)
+            self.test_report = {"status": status, "log_tail": log_text[-12000:], "metrics": metrics,
+                                "result_path": result_path, "error": error}
+            self._write_test_state()
+            self.update_test(test, **self.test_report)
+            self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
+            self._write_test_state()
+        except (OSError, ValueError, RuntimeError, HTTPError, URLError) as exc:
+            print(f"[queue agent] test {test['id']} failed: {exc}", flush=True)
+            if isinstance(exc, HTTPError) and exc.code == 404 and not self.test_process_matches(self.test_pid, test["id"]):
+                self._cleanup_test_stage(test)
+                self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
+                self._write_test_state()
+                return
+            if self.test_report:
+                return
+            if not self.test_pid or not self.test_process_matches(self.test_pid, test["id"]):
+                self._cleanup_test_stage(test)
+                try:
+                    self.update_test(test, "failed", error=str(exc),
+                                     log_tail=log_path.read_text(encoding="utf-8", errors="replace")[-12000:] if log_path.exists() else "")
+                except (HTTPError, URLError, OSError):
+                    return
+                self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
+                self._write_test_state()
 
     def update_job(self, job: dict, status: str, **extra) -> dict:
         return self.request(f"/api/v1/agents/jobs/{job['id']}/status", {"agent_id": self.agent_id, "status": status, **extra}).get("job") or {}
@@ -1001,6 +1227,9 @@ class Agent:
         print(f"[queue agent] {self.agent_id} connected to {self.server}", flush=True)
         while not self.stop_requested:
             try:
+                if self.current_test:
+                    self.run_test(self.current_test)
+                    continue
                 if self.current_job:
                     if self.current_pid and self.process_matches(self.current_pid, str(self.current_job.get("id"))):
                         self.monitor_current_process()
@@ -1043,6 +1272,10 @@ class Agent:
                 preflights = response.get("preflight_jobs") or []
                 if preflights:
                     self.preflight(preflights[0])
+                    continue
+                test = self.claim_test(gpus)
+                if test:
+                    self.run_test(test)
                     continue
                 job = self.claim(gpus)
                 if job:
@@ -1140,10 +1373,16 @@ def main():
     if args.once:
         agent = agents[0]
         gpus = agent.gpu_status(); response = agent.heartbeat(gpus)
-        if response.get("preflight_jobs"): agent.preflight(response["preflight_jobs"][0])
+        if agent.current_test:
+            agent.run_test(agent.current_test)
+        elif response.get("preflight_jobs"): agent.preflight(response["preflight_jobs"][0])
         elif not agent.current_job:
-            job = agent.claim(gpus)
-            if job: agent.start_job(job)
+            test = agent.claim_test(gpus)
+            if test:
+                agent.run_test(test)
+            else:
+                job = agent.claim(gpus)
+                if job: agent.start_job(job)
         return
     def stop_agent(signum, frame):
         for agent in agents:

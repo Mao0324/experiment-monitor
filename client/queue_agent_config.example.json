@@ -19,6 +19,7 @@
   ],
   "script_scan_seconds": 300,
   "script_scan_limit": 300,
+  "test_profiles": [],
   "preflight_import_timeout_seconds": 90,
   "poll_seconds": 10,
   "gpu_idle_utilization_percent": 5,

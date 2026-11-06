@@ -110,6 +110,57 @@ class SmokeTest(unittest.TestCase):
         with urlopen(request, timeout=2) as response:
             return response.status, json.loads(response.read())
 
+    def test_web_test_request_requires_confirmation_and_agent_lease(self):
+        run_id = "test-route-partial"
+        self.post_json("/api/v1/runs/start", {"run_id": run_id, "name": "Test route partial", "total_epochs": 10})
+        self.post_json(f"/api/v1/runs/{run_id}/progress", {
+            "epoch": 3, "phase": "epoch", "output_binding": {
+                "save_dir": "/data/runs/ESCVehicle/test-route-partial",
+            },
+        })
+        self.post_json("/api/v1/agents/heartbeat", {
+            "agent_id": "test-agent", "hostname": "test-host", "gpus": [],
+            "capabilities": {"test_v1": True},
+            "test_profiles": [{"id": "esc", "label": "ESCVehicle",
+                               "run_prefixes": ["/data/runs/ESCVehicle"], "supports_incomplete": True}],
+        })
+        cookies = http.cookiejar.CookieJar()
+        browser = build_opener(HTTPCookieProcessor(cookies))
+        login = Request(self.base + "/login", data=urlencode({"password": "test-password"}).encode(), method="POST")
+        with browser.open(login, timeout=2):
+            pass
+        with browser.open(self.base + f"/api/v1/web/runs/{run_id}/tests", timeout=2) as response:
+            self.assertEqual(json.loads(response.read())["profiles"][0]["id"], "esc")
+
+        def request_test(body):
+            request = Request(self.base + f"/api/v1/web/runs/{run_id}/tests",
+                              data=json.dumps(body).encode(), method="POST",
+                              headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"})
+            return browser.open(request, timeout=2)
+
+        basic = {"hostname": "test-host", "profile_id": "esc", "password": "test-password"}
+        with self.assertRaises(HTTPError) as incomplete:
+            request_test(basic)
+        self.assertEqual(incomplete.exception.code, 400)
+        with self.assertRaises(HTTPError) as wrong_password:
+            request_test({**basic, "password": "wrong", "confirm_incomplete": True,
+                          "confirm_name": "Test route partial"})
+        self.assertEqual(wrong_password.exception.code, 403)
+        with request_test({**basic, "confirm_incomplete": True,
+                           "confirm_name": "Test route partial"}) as response:
+            self.assertEqual(response.status, 202)
+            created = json.loads(response.read())["test"]
+        self.assertFalse(created["retain_results"])
+        _, response = self.post_json("/api/v1/agents/tests/claim", {
+            "agent_id": "test-agent", "gpus": [{"index": 0, "idle_for_seconds": 60,
+                                                 "memory_used_mb": 20, "utilization_percent": 0}],
+        })
+        self.assertEqual(response["test"]["id"], created["id"])
+        _, response = self.post_json(f"/api/v1/agents/tests/{created['id']}/status", {
+            "agent_id": "test-agent", "status": "completed", "metrics": {"map": 0.42},
+        })
+        self.assertEqual(response["test"]["metrics"], {"map": 0.42})
+
     def test_end_to_end(self):
         with self.assertRaises(HTTPError) as caught:
             self.post_json("/api/v1/runs/start", {}, token=False)
@@ -984,7 +1035,7 @@ class SmokeTest(unittest.TestCase):
             experiment_name="callback smoke",
             request_timeout=1,
         )
-        result = monitor.train(FakeModel(), epochs=2)
+        result = monitor.train(FakeModel(), epochs=2, **{"model": "model.yaml"})
         self.assertEqual(result, "training-result")
 
         failed_monitor = YoloExperimentMonitor(

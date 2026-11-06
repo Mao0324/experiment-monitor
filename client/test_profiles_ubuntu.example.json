@@ -1,0 +1,35 @@
+[
+  {
+    "id": "escvehicle",
+    "label": "ESCVehicle · OBB 测试集",
+    "run_prefixes": [
+      "/data1/MCONG/TwoStream_Yolov8/runs/ESCVehicle",
+      "/data/MCONG/TwoStream_Yolov8/runs/ESCVehicle"
+    ],
+    "script": "/data1/MCONG/TwoStream_Yolov8/test_escvehicle.py",
+    "args_complete": ["--experiment", "{run_dir}", "--weights", "best", "--save-metrics"],
+    "args_incomplete": ["--experiment", "{run_dir}", "--weights", "best"]
+  },
+  {
+    "id": "dronevehicle",
+    "label": "DroneVehicle · OBB 测试集",
+    "run_prefixes": [
+      "/data1/MCONG/TwoStream_Yolov8/runs/DroneVehicle",
+      "/data/MCONG/TwoStream_Yolov8/runs/DroneVehicle"
+    ],
+    "script": "/data1/MCONG/TwoStream_Yolov8/test_dronevehicle.py",
+    "args_complete": ["--experiment", "{run_dir}", "--weights", "best", "--save-metrics"],
+    "args_incomplete": ["--experiment", "{run_dir}", "--weights", "best"]
+  },
+  {
+    "id": "dronevehicle840",
+    "label": "DroneVehicleOfficial840 · OBB 测试集",
+    "run_prefixes": [
+      "/data1/MCONG/TwoStream_Yolov8/runs/DroneVehicleOfficial840",
+      "/data/MCONG/TwoStream_Yolov8/runs/DroneVehicleOfficial840"
+    ],
+    "script": "/data1/MCONG/TwoStream_Yolov8/test_dronevehicle_840.py",
+    "args_complete": ["--experiment", "{run_dir}", "--weights", "best", "--save-metrics"],
+    "args_incomplete": ["--experiment", "{run_dir}", "--weights", "best"]
+  }
+]

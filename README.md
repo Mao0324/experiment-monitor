@@ -30,11 +30,13 @@
 - 队列逐项解释未启动原因，包括缺少 GPU 数、显存不足、利用率超限和剩余空闲时间；
 - 可复制历史队列任务或基于由队列启动的实验新建，并可按“脚本 × batch”批量生成消融任务；
 - 支持完成当前 Epoch 后安全暂停、从最新 `last.pt` 一键恢复；Agent 重启后可重新接管遗留训练进程；
+- 实验详情页可请求测试集评估；按训练机/数据集选择本地测试方案，完成实验保留 `metrics.yaml`，未完成实验二次确认后只保留网页结果并清理隔离目录；
 - OOM、NaN、loss 爆炸、磁盘不足和进程消失会显示具体建议，但不会未经允许修改代码。
 
 服务端没有 PyPI 依赖，只使用 Python 标准库，适合低配置服务器。训练端同样不增加额外依赖，直接使用 Ultralytics 已提供的回调机制。
 
 完整步骤见 [DEPLOY.md](DEPLOY.md)。接入示例见 [client/train_example.py](client/train_example.py)。
+测试方案配置与执行边界见 [TEST_RUNS.md](TEST_RUNS.md)。
 使用 `device="4,5"` 等自动 DDP 时，请改用 [DDP_INTEGRATION.md](DDP_INTEGRATION.md) 和
 [client/train_dronevehicle_ddp_fixed.py](client/train_dronevehicle_ddp_fixed.py)。
 

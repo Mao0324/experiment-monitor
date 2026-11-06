@@ -27,10 +27,12 @@ class MonitoredTrainingTest(unittest.TestCase):
         model = Model()
         trainer = object()
         with patch.dict(os.environ, {}, clear=True):
-            result = module.train_with_monitor(model, trainer=trainer, device="2", batch=4)
+            result = module.train_with_monitor(model, trainer=trainer, device="2", batch=4,
+                                               **{"model": "model.yaml"})
             self.assertEqual(module.agent_device("2", single_gpu=True), "2")
         self.assertEqual(result, "trained")
-        self.assertEqual(model.calls, [{"trainer": trainer, "device": "2", "batch": 4}])
+        self.assertEqual(model.calls, [{"trainer": trainer, "device": "2", "batch": 4,
+                                        "model": "model.yaml"}])
 
     def test_queue_uses_assigned_physical_devices(self):
         with patch.dict(os.environ, {"YOLO_QUEUE_JOB_ID": "job", "CUDA_VISIBLE_DEVICES": "5,7"}):
@@ -55,8 +57,8 @@ class MonitoredTrainingTest(unittest.TestCase):
             def __init__(self, experiment_name=None):
                 calls.append(("name", experiment_name))
 
-            def train(self, model, **kwargs):
-                calls.append(("train", model, kwargs))
+            def train(self, yolo_model, **kwargs):
+                calls.append(("train", yolo_model, kwargs))
                 return "monitored"
 
         fake = types.SimpleNamespace(YoloExperimentMonitor=Monitor)
@@ -65,10 +67,12 @@ class MonitoredTrainingTest(unittest.TestCase):
         env = {"YOLO_MONITOR_URL": "https://example.test", "YOLO_MONITOR_TOKEN": "secret",
                "YOLO_EXPERIMENT_NAME": "queue-run"}
         with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {"yolo_monitor": fake}):
-            result = module.train_with_monitor(model, trainer=trainer, device="5", batch=8)
+            result = module.train_with_monitor(model, trainer=trainer, device="5", batch=8,
+                                               **{"model": "model.yaml"})
         self.assertEqual(result, "monitored")
         self.assertEqual(calls, [("name", "queue-run"),
-                                 ("train", model, {"trainer": trainer, "device": "5", "batch": 8})])
+                                 ("train", model, {"trainer": trainer, "device": "5", "batch": 8,
+                                                   "model": "model.yaml"})])
         self.assertFalse(model.calls)
 
 

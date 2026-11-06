@@ -69,6 +69,10 @@ Agent 会设置以下环境变量：
 
 训练脚本需要读取这些变量。`train_dronevehicle_ddp_fixed.py` 已提供完整示例。普通命令也可以使用 `{batch}` 和 `{resume}` 占位符。
 
+## 测试集评估
+
+网页「产物 → 测试集评估」使用独立的 `test_profiles` 配置，按主机与数据集选择测试脚本；测试任务与训练队列共享 GPU 预留。`ubuntu` 训练机的三个 `spikeyolo` 测试方案、未完成实验的临时目录隔离和部署说明见 [TEST_RUNS.md](TEST_RUNS.md)。
+
 ## 异常策略
 
 - `notify`：发送提醒，训练继续运行。

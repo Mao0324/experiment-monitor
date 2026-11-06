@@ -384,6 +384,27 @@ class Store:
                     message TEXT NOT NULL DEFAULT '',
                     data_json TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE TABLE IF NOT EXISTS test_requests (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                    profile_id TEXT NOT NULL,
+                    hostname TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    retain_results INTEGER NOT NULL,
+                    run_dir TEXT NOT NULL,
+                    agent_id TEXT NOT NULL DEFAULT '',
+                    assigned_gpu INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    log_tail TEXT NOT NULL DEFAULT '',
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    result_path TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_test_requests_claim
+                    ON test_requests(status, hostname, created_at);
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
@@ -445,6 +466,8 @@ class Store:
             agent_migrations = {
                 "catalog_json": "TEXT NOT NULL DEFAULT '[]'",
                 "capabilities_json": "TEXT NOT NULL DEFAULT '{}'",
+                "test_profiles_json": "TEXT NOT NULL DEFAULT '[]'",
+                "current_test_id": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in agent_migrations.items():
                 if column not in agent_columns:
@@ -1539,11 +1562,19 @@ class Store:
         gpus = payload.get("gpus") if isinstance(payload.get("gpus"), list) else []
         state = str(payload.get("state") or "idle")[:30]
         current_job_id = str(payload.get("current_job_id") or "")[:80]
+        current_test_id = str(payload.get("current_test_id") or "")[:80]
         reminder_seconds = max(60, int(payload.get("idle_reminder_seconds") or 1800))
         reminder_count = max(1, min(16, int(payload.get("idle_reminder_gpu_count") or 1)))
         catalog = payload.get("catalog") if isinstance(payload.get("catalog"), list) else []
         catalog = catalog[:500]
         capabilities = payload.get("capabilities") if isinstance(payload.get("capabilities"), dict) else {}
+        profiles = payload.get("test_profiles") if isinstance(payload.get("test_profiles"), list) else []
+        profiles = [
+            {"id": str(item.get("id") or "")[:80], "label": str(item.get("label") or "")[:120],
+             "run_prefixes": [str(value)[:1000] for value in (item.get("run_prefixes") or [])[:8]],
+             "supports_incomplete": bool(item.get("supports_incomplete"))}
+            for item in profiles[:30] if isinstance(item, dict) and item.get("id")
+        ]
         idle_count = sum(
             1 for gpu in gpus if isinstance(gpu, dict) and gpu.get("cuda_usable") is not False
             and gpu.get("telemetry_usable") is not False
@@ -1558,17 +1589,18 @@ class Store:
             notified = 1 if state == "idle" and idle_count >= reminder_count else 0
             conn.execute(
                 """INSERT INTO agents
-                (id,hostname,updated_at,state,gpus_json,current_job_id,idle_reminder_seconds,idle_reminder_gpu_count,idle_notified,catalog_json,capabilities_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                (id,hostname,updated_at,state,gpus_json,current_job_id,current_test_id,idle_reminder_seconds,idle_reminder_gpu_count,idle_notified,catalog_json,capabilities_json,test_profiles_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
                 hostname=excluded.hostname,updated_at=excluded.updated_at,state=excluded.state,
                 gpus_json=excluded.gpus_json,current_job_id=excluded.current_job_id,
+                current_test_id=excluded.current_test_id,
                 idle_reminder_seconds=excluded.idle_reminder_seconds,
                 idle_reminder_gpu_count=excluded.idle_reminder_gpu_count,
                 idle_notified=excluded.idle_notified,catalog_json=excluded.catalog_json,
-                capabilities_json=excluded.capabilities_json""",
-                (agent_id, hostname, now, state, json.dumps(gpus, ensure_ascii=False), current_job_id,
+                capabilities_json=excluded.capabilities_json,test_profiles_json=excluded.test_profiles_json""",
+                (agent_id, hostname, now, state, json.dumps(gpus, ensure_ascii=False), current_job_id, current_test_id,
                  reminder_seconds, reminder_count, notified, json.dumps(catalog, ensure_ascii=False),
-                 json.dumps(capabilities, ensure_ascii=False)),
+                 json.dumps(capabilities, ensure_ascii=False), json.dumps(profiles, ensure_ascii=False)),
             )
         self.reconcile_catalog_lineage()
         return self.get_agent(agent_id), should_notify
@@ -1582,6 +1614,7 @@ class Store:
         result["gpus"] = safe_json(result.pop("gpus_json"), [])
         result["catalog"] = safe_json(result.pop("catalog_json"), [])
         result["capabilities"] = safe_json(result.pop("capabilities_json"), {})
+        result["test_profiles"] = safe_json(result.pop("test_profiles_json"), [])
         result["idle_notified"] = bool(result["idle_notified"])
         return result
 
@@ -1589,6 +1622,178 @@ class Store:
         with self.connect() as conn:
             rows = conn.execute("SELECT id FROM agents ORDER BY updated_at DESC").fetchall()
         return [agent for row in rows if (agent := self.get_agent(row["id"]))]
+
+    @staticmethod
+    def _test_profile_matches(profile: dict, run_dir: str) -> bool:
+        if not run_dir.startswith("/") or ".." in Path(run_dir).parts:
+            return False
+        return any(
+            prefix.startswith("/") and ".." not in Path(prefix).parts
+            and run_dir.rsplit("/", 1)[0] == prefix.rstrip("/")
+            for prefix in profile.get("run_prefixes", []) if isinstance(prefix, str)
+        )
+
+    def test_profiles_for_run(self, run: dict) -> list[dict]:
+        run_dir = str((run.get("result") or {}).get("save_dir") or "")
+        if not run_dir:
+            return []
+        profiles = {}
+        queue_job = self.get_queue_job_by_run(run["id"], False)
+        expected_host = str((queue_job or {}).get("target_hostname") or
+                            (run.get("parameters") or {}).get("host") or "")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat(timespec="seconds")
+        for agent in self.list_agents():
+            if (agent["updated_at"] < cutoff or not agent["capabilities"].get("test_v1")
+                    or expected_host and agent["hostname"] != expected_host):
+                continue
+            for profile in agent.get("test_profiles") or []:
+                if self._test_profile_matches(profile, run_dir):
+                    profiles[(agent["hostname"], profile["id"])] = {
+                        "hostname": agent["hostname"], "id": profile["id"],
+                        "label": profile["label"],
+                        "supports_incomplete": profile["supports_incomplete"],
+                    }
+        return list(profiles.values())
+
+    @staticmethod
+    def _test_row(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["retain_results"] = bool(item["retain_results"])
+        item["metrics"] = safe_json(item.pop("metrics_json"), {})
+        return item
+
+    def list_test_requests(self, run_id: str) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM test_requests WHERE run_id=? ORDER BY created_at DESC LIMIT 30", (run_id,)
+            ).fetchall()
+        items = [self._test_row(row) for row in rows]
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec="seconds")
+        agents = {agent["id"]: agent for agent in self.list_agents()}
+        for item in items:
+            if item["status"] not in {"leased", "running"} or item["updated_at"] >= cutoff:
+                continue
+            agent = agents.get(item["agent_id"])
+            if not agent or agent["updated_at"] < cutoff or agent.get("current_test_id") != item["id"]:
+                item["health_warning"] = "Agent 心跳未确认此测试；等待恢复核验"
+                item["status"] = "疑似掉线（待核验）"
+        return items
+
+    def create_test_request(self, run_id: str, payload: dict) -> dict:
+        run = self.get_run(run_id)
+        if not run:
+            raise LookupError("run not found")
+        run_dir = str((run.get("result") or {}).get("save_dir") or "")
+        profile_id = str(payload.get("profile_id") or "")
+        hostname = str(payload.get("hostname") or "")
+        profile = next((item for item in self.test_profiles_for_run(run)
+                        if item["id"] == profile_id and item["hostname"] == hostname), None)
+        if not profile:
+            raise ValueError("此实验没有可用的训练机测试方案或 Agent 已离线")
+        complete = run["status"] == "completed" and (
+            int(run.get("total_epochs") or 0) == 0
+            or int(run.get("current_epoch") or 0) >= int(run["total_epochs"])
+        )
+        if not complete:
+            if not profile["supports_incomplete"]:
+                raise ValueError("此测试方案不支持未完成实验")
+            if payload.get("confirm_incomplete") is not True or str(payload.get("confirm_name") or "") != run["name"]:
+                raise ValueError("未完成实验需要两次确认，并准确输入完整实验名称")
+        now = utc_now()
+        request_id = secrets.token_hex(12)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            pending = conn.execute(
+                "SELECT id FROM test_requests WHERE run_id=? AND status IN ('queued','leased','running')", (run_id,)
+            ).fetchone()
+            if pending:
+                raise ValueError("此实验已有等待中或正在运行的测试")
+            conn.execute(
+                """INSERT INTO test_requests
+                (id,run_id,profile_id,hostname,status,retain_results,run_dir,created_at,updated_at)
+                VALUES (?,?,?,?,'queued',?,?,?,?)""",
+                (request_id, run_id, profile_id, hostname, int(complete), run_dir, now, now),
+            )
+        return self.list_test_requests(run_id)[0]
+
+    def claim_test_request(self, agent_id: str, gpus: list[dict]) -> dict | None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            agent = conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
+            if not agent or not safe_json(agent["capabilities_json"], {}).get("test_v1"):
+                return None
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec="seconds")
+            if (agent["updated_at"] < cutoff or agent["state"] != "idle"
+                    or agent["current_job_id"] or agent["current_test_id"]):
+                return None
+            profiles = {item["id"]: item for item in safe_json(agent["test_profiles_json"], [])}
+            reserved = set()
+            for row in conn.execute(
+                """SELECT q.assigned_gpus_json FROM queue_jobs q JOIN agents a ON a.id=q.agent_id
+                WHERE a.hostname=? AND q.status IN ('leased','running')""", (agent["hostname"],)
+            ):
+                reserved.update(safe_json(row["assigned_gpus_json"], []))
+            for row in conn.execute(
+                "SELECT assigned_gpu FROM test_requests WHERE hostname=? AND status IN ('leased','running')",
+                (agent["hostname"],),
+            ):
+                if row["assigned_gpu"] is not None:
+                    reserved.add(row["assigned_gpu"])
+            rows = conn.execute(
+                "SELECT * FROM test_requests WHERE hostname=? AND status='queued' ORDER BY created_at ASC",
+                (agent["hostname"],),
+            ).fetchall()
+            for row in rows:
+                profile = profiles.get(row["profile_id"])
+                if not profile or not self._test_profile_matches(profile, row["run_dir"]):
+                    continue
+                for gpu in gpus:
+                    try:
+                        index = int(gpu["index"])
+                        ready = (index not in reserved and gpu.get("cuda_usable") is not False
+                                 and gpu.get("telemetry_usable") is not False
+                                 and float(gpu.get("utilization_percent") or 0) <= 5
+                                 and float(gpu.get("memory_used_mb") or 0) <= 3000
+                                 and float(gpu.get("idle_for_seconds") or 0) >= 60)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if ready:
+                        conn.execute(
+                            """UPDATE test_requests SET status='leased',agent_id=?,assigned_gpu=?,
+                            started_at=?,updated_at=? WHERE id=? AND status='queued'""",
+                            (agent_id, index, now, now, row["id"]),
+                        )
+                        leased = conn.execute("SELECT * FROM test_requests WHERE id=?", (row["id"],)).fetchone()
+                        return self._test_row(leased)
+        return None
+
+    def update_test_request(self, test_id: str, payload: dict) -> dict | None:
+        status = str(payload.get("status") or "")
+        if status not in {"running", "completed", "failed"}:
+            raise ValueError("invalid test status")
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM test_requests WHERE id=?", (test_id,)).fetchone()
+            if not row:
+                return None
+            if row["agent_id"] == str(payload.get("agent_id") or "") and row["status"] == status and status in {"completed", "failed"}:
+                return self._test_row(row)
+            if row["agent_id"] != str(payload.get("agent_id") or "") or row["status"] not in {"leased", "running"}:
+                raise PermissionError("test lease conflict")
+            result_path = str(payload.get("result_path") or "")[:1000] if row["retain_results"] else ""
+            if result_path and not result_path.startswith(row["run_dir"].rstrip("/") + "/test/"):
+                raise ValueError("test result path is outside this run's test directory")
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            conn.execute(
+                """UPDATE test_requests SET status=?,updated_at=?,ended_at=?,log_tail=?,
+                metrics_json=?,result_path=?,error=? WHERE id=?""",
+                (status, now, now if status in {"completed", "failed"} else None,
+                 str(payload.get("log_tail") or "")[-12000:], json.dumps(metrics, ensure_ascii=False)[:12000],
+                 result_path, str(payload.get("error") or "")[:2000], test_id),
+            )
+            return self._test_row(conn.execute("SELECT * FROM test_requests WHERE id=?", (test_id,)).fetchone())
 
     def pending_preflights(self, agent_id: str, limit: int = 3) -> list[dict]:
         with self.connect() as conn:
@@ -1656,6 +1861,12 @@ class Store:
                         reserved_gpus.add(int(index))
                     except (TypeError, ValueError):
                         continue
+            for test_row in conn.execute(
+                """SELECT assigned_gpu FROM test_requests WHERE hostname=?
+                AND status IN ('leased','running')""", (agent["hostname"],)
+            ):
+                if test_row["assigned_gpu"] is not None:
+                    reserved_gpus.add(test_row["assigned_gpu"])
             rows = conn.execute(
                 """SELECT * FROM queue_jobs WHERE status IN ('queued','waiting_memory') AND preflight_status='passed'
                 AND (not_before IS NULL OR not_before<=?) ORDER BY priority DESC, created_at ASC""",
@@ -2634,6 +2845,9 @@ STYLE += """
 
 
 STYLE += ".script-picker-folder{margin-bottom:14px}.script-picker-folder>label{display:block;margin-bottom:5px}.script-picker-folder select{width:100%}.script-search-wrap>input:disabled{opacity:.6;cursor:not-allowed}.agent-view-toolbar{display:flex;align-items:end;gap:14px;flex-wrap:wrap;margin-bottom:14px}.agent-view-toolbar label{display:grid;gap:5px;color:var(--muted);font-size:12px}.agent-view-toolbar select{min-width:220px}.agent-card[hidden]{display:none}@media(max-width:700px){.agent-view-toolbar label,.agent-view-toolbar select{width:100%}}"
+
+
+STYLE += ".test-results{margin-top:16px}.test-result-row{padding:14px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.test-result-row strong{font-size:14px}.test-metric-line{margin:8px 0;font-weight:650;color:var(--text)}.test-result-row details{margin-top:8px}.test-result-row pre{max-height:220px}"
 
 
 def page(title: str, body: str, refresh: int | None = None) -> str:
@@ -3687,7 +3901,7 @@ def run_html(run: dict, events: list[dict]) -> str:
     <section class="tab-panel" id="tab-resources" role="tabpanel" hidden><div class="panel"><h3>GPU / 主机状态</h3><div id="hostStatus">{host_status_html(run.get('host_status') or {})}</div></div></section>
     <section class="tab-panel" id="tab-logs" role="tabpanel" hidden><div class="panel"><h3>实时日志尾部</h3><div class="muted">SSE 实时更新；保留最近约 12,000 个字符。</div><pre id="logTail" class="log-tail">{log_text}</pre></div></section>
     <section class="tab-panel" id="tab-environment" role="tabpanel" hidden><div class="panel"><details><summary><strong>可复现信息</strong> · {html.escape(environment)}</summary><div id="reproducibility">{reproducibility_html(run.get('parameters') or {})}</div></details></div>{lineage_panel}<div class="panel"><h3>相对基线的模型配置差异</h3><pre>{html.escape(summary.get('config_diff') or '识别到明确父实验且两次实验都上传模型 YAML 后，将显示逐行差异。')}</pre></div></section>
-    <section class="tab-panel" id="tab-artifacts" role="tabpanel" hidden>{artifact_panel or '<div class="panel"><p class="muted">实验尚未上报输出目录。</p></div>'}<div class="panel"><h3>结果信息</h3><div id="resultMetrics">{metric_chips(run['result'])}</div></div></section>
+    <section class="tab-panel" id="tab-artifacts" role="tabpanel" hidden>{artifact_panel or '<div class="panel"><p class="muted">实验尚未上报输出目录。</p></div>'}<div class="panel"><h3>结果信息</h3><div id="resultMetrics">{metric_chips(run['result'])}</div></div><div class="panel"><div class="panel-heading"><div><h3>测试集评估</h3><p class="muted">完成实验保留测试文件；未完成实验只保留网页结果，临时目录在训练机清理。</p></div></div><div class="controls"><select id="testProfile" class="filter-input" aria-label="测试方案"></select><button id="startTest" class="button" type="button">运行测试集</button><span id="testMessage" class="muted"></span></div><div id="testResults" class="test-results"></div></div></section>
     <section class="tab-panel" id="tab-notes" role="tabpanel" hidden><div class="panel"><div class="panel-heading"><h3>实验记录与标签</h3><span class="summary-chip">核心记录完整度 <strong>{metadata_complete} / {len(metadata_fields)}</strong></span></div><form id="metadataForm" class="notes-grid"><label><span class="label">分组</span><input id="groupName" class="filter-input" maxlength="80" value="{html.escape(run.get('group_name') or '')}" placeholder="例如 DroneVehicle"></label><label><span class="label">标签（逗号分隔）</span><input id="tagsInput" class="filter-input" value="{html.escape(', '.join(run.get('tags') or []))}" placeholder="PaperLAF, FP32Safe, baseline"></label><label class="controls"><input id="favoriteInput" type="checkbox" {'checked' if run.get('favorite') else ''}>收藏</label><label><span class="label">Hypothesis · 实验假设</span><textarea id="hypothesis" class="filter-input" placeholder="为什么做这个实验？预期哪些指标会改善？">{html.escape(run.get('hypothesis') or '')}</textarea></label><label><span class="label">Modification · 修改内容</span><textarea id="changeNotes" class="filter-input" placeholder="与父实验相比只改了什么？">{html.escape(run.get('change_notes') or '')}</textarea></label><label><span class="label">Conclusion · 结论</span><textarea id="conclusion" class="filter-input" placeholder="训练结束后填写结论">{html.escape(run.get('conclusion') or '')}</textarea></label><label><span class="label">结果记录</span><textarea id="resultNotes" class="filter-input">{html.escape(run.get('result_notes') or '')}</textarea></label><label><span class="label">下一步</span><textarea id="nextStep" class="filter-input">{html.escape(run.get('next_step') or '')}</textarea></label><details class="form-wide"><summary>对比基线（可选）</summary><label>选择父实验<select id="baselineRunId" class="filter-input">{baseline_options}</select></label></details><label><span class="label">管理员密码</span><input id="metadataPassword" class="filter-input" type="password" autocomplete="current-password" required></label><div class="controls wide"><button class="button" type="submit">保存实验记录</button><span id="metadataMessage" class="muted">系统只补空字段，不覆盖人工内容。</span></div></form></div>{ai_panel}
     <details class="panel danger-zone"><summary>危险区域 · 删除实验记录</summary><div><p class="muted">删除将永久移除实验及全部指标。需要输入下面显示的实验编号和管理员密码。</p><form id="deleteRunForm" method="post" action="/runs/{quote(run['id'])}/delete"><label>输入 <strong>{html.escape(display_code)}</strong> 确认<br><input class="confirm-name" name="confirm_name" autocomplete="off" required></label><label>管理员密码<br><input type="password" name="password" autocomplete="current-password" required></label><button class="button danger" type="submit">永久删除</button></form></div></details></section>
     <script>
@@ -3699,6 +3913,9 @@ def run_html(run: dict, events: list[dict]) -> str:
     const aiButton=document.getElementById('generateAi'),aiMessage=document.getElementById('aiMessage'),aiReport=document.getElementById('aiReport'),aiEmpty=document.getElementById('aiEmpty');let aiPollTimer=null;
     const updateAiUi=r=>{{const status=r.ai_status||'not_requested',emailStatus=r.ai_email_status||'not_requested';document.getElementById('aiStatusValue').textContent=aiLabels[status]||status;document.getElementById('aiModelsValue').textContent=(r.ai_models||[]).join('、')||'—';document.getElementById('aiRequestedAt').textContent=r.ai_requested_at?'　提交时间：'+r.ai_requested_at:'';document.getElementById('aiGeneratedAt').textContent=r.ai_generated_at?'　生成时间：'+r.ai_generated_at:'';document.getElementById('aiEmailStatus').textContent='邮件：'+(emailLabels[emailStatus]||emailStatus)+(r.ai_email_sent_at?'（'+r.ai_email_sent_at+'）':'');const error=r.ai_error||r.ai_email_error||'';aiMessage.textContent=error||(status==='running'?'服务器已受理，正在生成报告；刷新页面不会丢失此状态。':status==='completed'?'报告已生成。':'');const report=r.ai_report||'';aiReport.textContent=report;aiReport.style.display=report?'block':'none';aiEmpty.style.display=report?'none':'block';aiButton.disabled=status==='running';aiButton.textContent=status==='running'?'正在生成…':'生成结论并发送邮件';if(status==='running'&&!aiPollTimer)aiPollTimer=setInterval(pollAi,3000);if(status!=='running'&&aiPollTimer){{clearInterval(aiPollTimer);aiPollTimer=null}}}};
     const pollAi=async()=>{{try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/ai-status',{{headers:{{'X-Monitor-Request':'dashboard'}},cache:'no-store'}});if(response.ok)updateAiUi(await response.json())}}catch{{}}}};
+    const testProfile=document.getElementById('testProfile'),testResults=document.getElementById('testResults'),testMessage=document.getElementById('testMessage'),testButton=document.getElementById('startTest');
+    async function pollTests(){{try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/tests',{{cache:'no-store'}});if(!response.ok)return;const data=await response.json(),selected=testProfile.value;testProfile.replaceChildren();for(const profile of data.profiles||[]){{const option=document.createElement('option');option.value=profile.hostname+'|'+profile.id;option.textContent=profile.label+' · '+profile.hostname;testProfile.append(option)}}if([...testProfile.options].some(option=>option.value===selected))testProfile.value=selected;testButton.disabled=!testProfile.options.length;testResults.replaceChildren();for(const item of data.tests||[]){{const row=document.createElement('div');row.className='test-result-row';const heading=document.createElement('strong');heading.textContent=(item.retain_results?'正式测试':'未完成实验 · 临时测试')+' · '+({{queued:'等待空闲 GPU',leased:'Agent 已领取',running:'测试中',completed:'已完成',failed:'失败'}}[item.status]||item.status);row.append(heading);const info=document.createElement('div');info.className='muted';info.textContent=item.profile_id+' · '+item.hostname+' · '+item.created_at;row.append(info);if(item.error){{const error=document.createElement('div');error.textContent=item.error;row.append(error)}}const metrics=item.metrics||{{}};if(Object.keys(metrics).length){{const metricLine=document.createElement('div');metricLine.className='test-metric-line';metricLine.textContent=Object.entries(metrics).map(([key,value])=>key+' '+Number(value).toFixed(4)).join(' · ');row.append(metricLine)}}if(item.result_path){{const path=document.createElement('div');path.className='muted';path.textContent='已保留：'+item.result_path;row.append(path)}}if(item.log_tail){{const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='查看测试日志';const pre=document.createElement('pre');pre.className='log-tail';pre.textContent=item.log_tail;details.append(summary,pre);row.append(details)}}testResults.append(row)}}if(!(data.tests||[]).length)testResults.textContent='尚无测试记录。';if(!(data.profiles||[]).length)testMessage.textContent='此实验没有在线训练机可用的测试方案。'}}catch{{testMessage.textContent='测试状态暂时无法刷新。'}}}}
+    testButton.addEventListener('click',async()=>{{const selected=testProfile.value;if(!selected)return;const [hostname,profile_id]=selected.split('|');let runStatus={json.dumps(run['status'])},currentEpoch={int(run.get('current_epoch') or 0)},totalEpochs={int(run.get('total_epochs') or 0)};try{{const response=await fetch('/api/v1/public/runs/'+encodeURIComponent(runId),{{cache:'no-store'}});if(response.ok){{const latest=(await response.json()).run;runStatus=latest.status;currentEpoch=latest.current_epoch||0;totalEpochs=latest.total_epochs||0}}}}catch{{}}const complete=runStatus==='completed'&&(!totalEpochs||currentEpoch>=totalEpochs);let confirmName='';if(!complete){{if(!confirm('这个实验尚未完整训练结束。测试只保留网页结果，不在原实验目录保存文件。确定继续吗？'))return;confirmName=prompt('第二次确认：请输入完整实验名称 '+{json.dumps(run['name'],ensure_ascii=False)}+'：');if(confirmName!=={json.dumps(run['name'],ensure_ascii=False)}){{if(confirmName!==null)alert('实验名称不匹配，未提交测试。');return}}}}const password=prompt('请输入管理员密码以提交测试：');if(password===null)return;testButton.disabled=true;testMessage.textContent='正在提交…';try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/tests',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{hostname,profile_id,confirm_incomplete:!complete,confirm_name:confirmName,password}})}});const result=await response.json();testMessage.textContent=response.ok?'已提交，等待空闲 GPU。':result.error||'提交失败';await pollTests()}}catch{{testMessage.textContent='网络错误，服务器未确认提交。'}}finally{{testButton.disabled=!testProfile.options.length}}}});pollTests();setInterval(pollTests,5000);
     const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText');const stream=new EventSource('/events/runs/'+encodeURIComponent(runId));stream.onopen=()=>{{dot.classList.remove('offline');liveText.textContent='实时连接正常'}};stream.onerror=()=>{{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'}};stream.onmessage=event=>{{const data=JSON.parse(event.data),r=data.run,f=data.fragments,total=r.total_epochs||0;document.getElementById('statusBadge').innerHTML=f.status;document.getElementById('epochValue').textContent=(r.current_epoch||0)+' / '+total;document.getElementById('batchValue').textContent=(r.current_batch??'—')+' / '+(r.total_batches??'—');document.getElementById('elapsedValue').textContent=duration(r.elapsed_seconds);document.getElementById('etaValue').textContent=duration(r.eta_seconds);document.getElementById('bestMapValue').textContent=f.best_map;document.getElementById('baselineDeltaValue').innerHTML=f.baseline_delta;document.getElementById('performanceMetrics').innerHTML=f.performance;document.getElementById('lossMetrics').innerHTML=f.losses;document.getElementById('environmentBrief').textContent=f.environment_brief;document.getElementById('progressFill').style.width=(total?Math.min(100,100*(r.current_epoch||0)/total):0)+'%';document.getElementById('latestMetrics').innerHTML=f.metrics;document.getElementById('bestEpoch').innerHTML=f.best;document.getElementById('hostStatus').innerHTML=f.host;document.getElementById('resultMetrics').innerHTML=f.result;document.getElementById('reproducibility').innerHTML=f.reproducibility;document.getElementById('logTail').textContent=r.log_tail||'训练端尚未上报日志。';if(window.updateTrendSources)window.updateTrendSources([{{id:r.id,name:r.name,events:data.events}}]);const errorBox=document.getElementById('dynamicError');if(r.error_message){{errorBox.style.display='block';document.getElementById('dynamicErrorText').textContent=r.error_message}}else errorBox.style.display='none';if(document.activeElement!==document.getElementById('groupName'))document.getElementById('groupName').value=r.group_name||'';if(document.activeElement!==document.getElementById('tagsInput'))document.getElementById('tagsInput').value=(r.tags||[]).join(', ');document.getElementById('favoriteInput').checked=!!r.favorite;for(const [id,key] of [['hypothesis','hypothesis'],['changeNotes','change_notes'],['resultNotes','result_notes'],['conclusion','conclusion'],['nextStep','next_step'],['baselineRunId','baseline_run_id']]){{const field=document.getElementById(id);if(document.activeElement!==field)field.value=r[key]||''}}updateAiUi(r)}};
     const form=document.getElementById('metadataForm');form.addEventListener('submit',async event=>{{event.preventDefault();const message=document.getElementById('metadataMessage'),password=document.getElementById('metadataPassword');message.textContent='保存中…';const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/metadata',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{group_name:document.getElementById('groupName').value,tags:document.getElementById('tagsInput').value,favorite:document.getElementById('favoriteInput').checked,hypothesis:document.getElementById('hypothesis').value,change_notes:document.getElementById('changeNotes').value,result_notes:document.getElementById('resultNotes').value,conclusion:document.getElementById('conclusion').value,next_step:document.getElementById('nextStep').value,baseline_run_id:document.getElementById('baselineRunId').value,password:password.value}})}});password.value='';message.textContent=response.ok?'已保存':(response.status===403?'管理员密码错误':'保存失败')}})}})();
     const aiForm=document.getElementById('aiGenerateForm');aiForm.addEventListener('submit',async event=>{{event.preventDefault();const password=document.getElementById('aiPassword');if(!password.value)return;aiButton.disabled=true;aiButton.textContent='正在提交…';aiMessage.textContent='正在向服务器提交请求…';const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),20000);try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/ai-generate',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{password:password.value,send_email:true}}),signal:controller.signal}});let result={{}};try{{result=await response.json()}}catch{{}}password.value='';if(response.ok){{updateAiUi(result);aiMessage.textContent='服务器已确认提交，正在生成报告；刷新页面不会丢失此状态。';await pollAi()}}else{{aiButton.disabled=false;aiButton.textContent='生成结论并发送邮件';aiMessage.textContent=result.error||(response.status===403?'管理员密码错误':'提交失败')}}}}catch(error){{aiButton.disabled=false;aiButton.textContent='生成结论并发送邮件';aiMessage.textContent=error.name==='AbortError'?'提交超时，服务器尚未确认，请稍后重试。':'网络错误，服务器未确认提交。'}}finally{{clearTimeout(timeout)}}}});pollAi();
@@ -3962,6 +4179,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/public/queue":
             self.send_json(200, {"jobs": STORE.list_queue_jobs_with_reasons(False), "agents": STORE.list_agents(), "server_time": utc_now()})
+            return
+        if path.startswith("/api/v1/web/runs/") and path.endswith("/tests"):
+            run_id = unquote(path[len("/api/v1/web/runs/") : -len("/tests")].strip("/"))
+            run = STORE.get_run(run_id)
+            if not run:
+                self.send_json(404, {"error": "run not found"})
+            else:
+                self.send_json(200, {"profiles": STORE.test_profiles_for_run(run),
+                                     "tests": STORE.list_test_requests(run_id)})
             return
         if path.startswith("/api/v1/web/runs/") and path.endswith("/ai-status"):
             run_id = unquote(path[len("/api/v1/web/runs/") : -len("/ai-status")].strip("/"))
@@ -4256,6 +4482,27 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"run": run})
             return
+        if path.startswith("/api/v1/web/runs/") and path.endswith("/tests"):
+            try:
+                payload = self.read_json()
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            password = str(payload.pop("password", ""))
+            if (self.headers.get("X-Monitor-Request") != "dashboard" or not CFG.admin_password
+                    or not hmac.compare_digest(password, CFG.admin_password)):
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            run_id = unquote(path[len("/api/v1/web/runs/") : -len("/tests")].strip("/"))
+            try:
+                test = STORE.create_test_request(run_id, payload)
+            except LookupError:
+                self.send_json(404, {"error": "run not found"})
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+            else:
+                self.send_json(HTTPStatus.ACCEPTED, {"test": test})
+            return
         queue_action_request = path.startswith("/api/v1/web/queue/") and path.endswith("/action")
         queue_update_request = path.startswith("/api/v1/web/queue/") and path.endswith("/update")
         queue_delete_request = path.startswith("/api/v1/web/queue/") and path.endswith("/delete")
@@ -4375,6 +4622,20 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.CONFLICT, {"error": "agent heartbeat required"})
                     return
                 self.send_json(200, {"job": job})
+                return
+            if path == "/api/v1/agents/tests/claim":
+                test = STORE.claim_test_request(str(payload.get("agent_id") or "")[:120],
+                                                payload.get("gpus") if isinstance(payload.get("gpus"), list) else [])
+                self.send_json(200, {"test": test})
+                return
+            if path.startswith("/api/v1/agents/tests/") and path.endswith("/status"):
+                test_id = path[len("/api/v1/agents/tests/") : -len("/status")].strip("/")
+                try:
+                    test = STORE.update_test_request(test_id, payload)
+                except PermissionError:
+                    self.send_json(HTTPStatus.CONFLICT, {"error": "test lease conflict"})
+                    return
+                self.send_json(200, {"test": test}) if test else self.send_json(404, {"error": "test not found"})
                 return
             if path.startswith("/api/v1/agents/jobs/"):
                 suffix = path[len("/api/v1/agents/jobs/"):].strip("/").split("/")

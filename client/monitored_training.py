@@ -20,13 +20,13 @@ def agent_device(requested: str | None, *, single_gpu: bool = False) -> str | No
     return assigned[0] if single_gpu else ",".join(assigned)
 
 
-def train_with_monitor(model, *, trainer=None, **train_args):
+def train_with_monitor(yolo_model, *, trainer=None, **train_args):
     """Keep the exact Trainer path; attach only the monitor's callbacks."""
     kwargs = {**train_args, **({"trainer": trainer} if trainer is not None else {})}
     if not os.getenv("YOLO_MONITOR_URL") or not os.getenv("YOLO_MONITOR_TOKEN"):
         if os.getenv("YOLO_QUEUE_JOB_ID"):
             raise RuntimeError("queue job is missing YOLO_MONITOR_URL or YOLO_MONITOR_TOKEN")
-        return model.train(**kwargs)
+        return yolo_model.train(**kwargs)
 
     from yolo_monitor import YoloExperimentMonitor
 
@@ -36,4 +36,4 @@ def train_with_monitor(model, *, trainer=None, **train_args):
     if "," in device:
         print("[YOLO monitor] DDP callbacks require an importable monitored Trainer; "
               "live Epoch updates may be unavailable for this entry point", flush=True)
-    return monitor.train(model, **kwargs)
+    return monitor.train(yolo_model, **kwargs)
