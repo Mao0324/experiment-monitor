@@ -1,6 +1,6 @@
 # 网页测试集评估
 
-实验详情的「产物」页可提交测试。网页只选择训练机公布的测试方案；测试命令由该训练机的 Agent 配置提供，不能从浏览器提交任意命令。每次提交需要管理员密码。
+实验详情的「总览」页有独立的 Test 测试集摘要和「运行测试集」按钮；「产物」页保留历次测试的完整指标、日志和文件路径。页面原有的 Best Val mAP、Epoch 曲线和验证集指标不被测试结果覆盖。网页只选择训练机公布的测试方案；测试命令由该训练机的 Agent 配置提供，不能从浏览器提交任意命令。每次提交需要管理员密码。
 
 在训练机 `/etc/yolo-monitor-agent.json` 中加入 `test_profiles`。`ubuntu` 训练机的三个已核实方案见 [client/test_profiles_ubuntu.example.json](client/test_profiles_ubuntu.example.json)。它们都使用 Agent 的 `training_python`（`/home/ubuntu/miniconda3/envs/spikeyolo/bin/python`），不使用脚本注释里的 `yolotwo`。别的训练机按其测试脚本和运行目录分别配置；未配置的主机不会显示测试按钮选项。
 

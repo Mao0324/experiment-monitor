@@ -58,6 +58,7 @@ class TestRequestsTest(unittest.TestCase):
     def test_completed_run_retains_result_and_reserves_gpu(self):
         store = self.server.STORE
         run = self.run_record("complete")
+        validation_before = store.metric_events(run["id"])
         self.assertEqual(len(store.test_profiles_for_run(run)), 1)
         test = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
         self.assertTrue(test["retain_results"])
@@ -77,6 +78,7 @@ class TestRequestsTest(unittest.TestCase):
         self.assertTrue(result["result_path"].endswith("metrics.yaml"))
         repeated = store.update_test_request(test["id"], {"agent_id": "ubuntu-slot-1", "status": "completed"})
         self.assertEqual(repeated["metrics"], {"mAP": 0.5})
+        self.assertEqual(store.metric_events(run["id"]), validation_before)
 
     def test_incomplete_run_needs_two_confirmations_and_never_retains_path(self):
         store = self.server.STORE
