@@ -98,6 +98,7 @@ class Agent:
         self.test_pid = 0
         self.test_stage = ""
         self.test_report: dict | None = None
+        self.test_thread: threading.Thread | None = None
         self.test_state_path = self.state_path.with_name(self.state_path.stem + ".test.json")
         self._load_state()
         self._load_test_state()
@@ -517,7 +518,7 @@ class Agent:
                 pass
         response = self.request("/api/v1/agents/heartbeat", {
             "agent_id": self.agent_id, "hostname": self.hostname,
-            "state": "testing" if self.current_test else "running" if self.current_job and self.current_pid else "idle",
+            "state": "running" if self.current_job and self.current_pid else "testing" if self.current_test else "idle",
             "current_job_id": (self.current_job or {}).get("id", ""), "gpus": gpus,
             "current_test_id": (self.current_test or {}).get("id", ""),
             "test_profiles": [
@@ -798,6 +799,15 @@ class Agent:
                 self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
                 self._write_test_state()
 
+    def start_test_thread(self, test: dict):
+        if self.test_thread and self.test_thread.is_alive():
+            return
+        self.current_test = test
+        self._write_test_state()
+        self.test_thread = threading.Thread(target=self.run_test, args=(test,), daemon=True,
+                                            name=f"test-{test['id']}")
+        self.test_thread.start()
+
     def update_job(self, job: dict, status: str, **extra) -> dict:
         return self.request(f"/api/v1/agents/jobs/{job['id']}/status", {"agent_id": self.agent_id, "status": status, **extra}).get("job") or {}
 
@@ -1071,7 +1081,12 @@ class Agent:
             if time.monotonic() - last_heartbeat >= self.poll_seconds:
                 last_heartbeat = time.monotonic()
                 try:
-                    self.heartbeat(self.gpu_status())
+                    gpus = self.gpu_status()
+                    self.heartbeat(gpus)
+                    if not self.current_test and not (self.test_thread and self.test_thread.is_alive()):
+                        test = self.claim_test(gpus)
+                        if test:
+                            self.start_test_thread(test)
                 except Exception as exc:
                     print(f"[queue agent] heartbeat failed: {exc}", flush=True)
             time.sleep(1)
@@ -1228,8 +1243,15 @@ class Agent:
         while not self.stop_requested:
             try:
                 if self.current_test:
-                    self.run_test(self.current_test)
-                    continue
+                    if self.test_thread and self.test_thread.is_alive():
+                        if not self.current_job:
+                            time.sleep(self.poll_seconds)
+                            continue
+                    elif self.current_job:
+                        self.start_test_thread(self.current_test)
+                    else:
+                        self.run_test(self.current_test)
+                        continue
                 if self.current_job:
                     if self.current_pid and self.process_matches(self.current_pid, str(self.current_job.get("id"))):
                         self.monitor_current_process()

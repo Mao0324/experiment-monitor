@@ -5,12 +5,39 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 
 AGENT = Path(__file__).resolve().parents[1] / "client" / "queue_agent.py"
 
 
 class AgentTestStageTest(unittest.TestCase):
+    def test_running_training_claims_test_without_waiting_for_idle(self):
+        spec = importlib.util.spec_from_file_location("test_concurrent_queue_agent", AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            agent = module.Agent({"server_url": "https://example.invalid", "api_token": "test",
+                                  "allowed_roots": [temporary], "log_directory": temporary,
+                                  "poll_seconds": 2})
+            job = {"id": "training", "name": "training"}
+            test = {"id": "test-while-training"}
+            agent.current_job = job
+            agent.current_pid = 123
+            agent.current_process = Mock()
+            agent.current_process.poll.side_effect = [None, 0, 0]
+            agent.read_new_log = Mock()
+            agent.heartbeat = Mock(return_value={})
+            agent.gpu_status = Mock(return_value=[{"index": 0, "memory_free_mb": 5120}])
+            agent.claim_test = Mock(return_value=test)
+            agent.start_test_thread = Mock()
+            agent.finish_process = Mock()
+            with patch.object(module.time, "sleep", return_value=None):
+                agent.monitor_current_process()
+            agent.claim_test.assert_called_once()
+            agent.start_test_thread.assert_called_once_with(test)
+            agent.finish_process.assert_called_once_with(job, 0)
+
     def test_incomplete_run_uses_isolated_directory(self):
         spec = importlib.util.spec_from_file_location("test_stage_queue_agent", AGENT)
         module = importlib.util.module_from_spec(spec)

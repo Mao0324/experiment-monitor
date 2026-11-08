@@ -109,7 +109,7 @@ class TestRequestsTest(unittest.TestCase):
                 "profile_id": "arbitrary", "hostname": "ubuntu", "command": "rm -rf /",
             })
 
-    def test_training_claim_excludes_test_gpu_and_test_claim_excludes_training_gpu(self):
+    def test_training_claim_excludes_test_gpu_and_test_can_share_training_gpu(self):
         store = self.server.STORE
         run = self.run_record("test-reserved")
         store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
@@ -122,7 +122,37 @@ class TestRequestsTest(unittest.TestCase):
         self.assertEqual(claimed["assigned_gpus"], [1])
         other = self.run_record("after-train")
         store.create_test_request(other["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        self.assertEqual(store.claim_test_request("ubuntu-slot-1", self.idle_gpus())["assigned_gpu"], 1)
+
+    def test_busy_gpu_needs_only_five_gib_free(self):
+        store = self.server.STORE
+        run = self.run_record("busy-gpu")
+        test = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        store.heartbeat_agent({
+            "agent_id": "ubuntu-slot-1", "hostname": "ubuntu", "state": "running",
+            "current_job_id": "training-job", "capabilities": {"test_v1": True},
+            "test_profiles": [self.profile], "gpus": [],
+        })
+        gpu = {"index": 0, "telemetry_usable": True, "cuda_usable": None,
+               "utilization_percent": 100, "memory_used_mb": 19000,
+               "memory_free_mb": 5119, "idle_for_seconds": 0}
+        self.assertIsNone(store.claim_test_request("ubuntu-slot-1", [gpu]))
+        gpu["memory_free_mb"] = 5120
+        claimed = store.claim_test_request("ubuntu-slot-1", [gpu])
+        self.assertEqual(claimed["id"], test["id"])
+        self.assertEqual(claimed["assigned_gpu"], 0)
+
+    def test_cancel_queued_test_but_not_leased_test(self):
+        store = self.server.STORE
+        run = self.run_record("cancel-test")
+        first = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        self.assertIsNone(store.cancel_test_request("wrong-run", first["id"]))
+        self.assertEqual(store.cancel_test_request(run["id"], first["id"])["status"], "cancelled")
         self.assertIsNone(store.claim_test_request("ubuntu-slot-1", self.idle_gpus()))
+        second = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        self.assertEqual(store.claim_test_request("ubuntu-slot-1", self.idle_gpus())["id"], second["id"])
+        with self.assertRaises(ValueError):
+            store.cancel_test_request(run["id"], second["id"])
 
 if __name__ == "__main__":
     unittest.main()

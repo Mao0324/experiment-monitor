@@ -119,7 +119,7 @@ class SmokeTest(unittest.TestCase):
             },
         })
         self.post_json("/api/v1/agents/heartbeat", {
-            "agent_id": "test-agent", "hostname": "test-host", "gpus": [],
+            "agent_id": "test-agent", "hostname": "test-host-web-test", "gpus": [],
             "capabilities": {"test_v1": True},
             "test_profiles": [{"id": "esc", "label": "ESCVehicle",
                                "run_prefixes": ["/data/runs/ESCVehicle"], "supports_incomplete": True}],
@@ -138,7 +138,7 @@ class SmokeTest(unittest.TestCase):
                               headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"})
             return browser.open(request, timeout=2)
 
-        basic = {"hostname": "test-host", "profile_id": "esc", "password": "test-password"}
+        basic = {"hostname": "test-host-web-test", "profile_id": "esc", "password": "test-password"}
         with self.assertRaises(HTTPError) as incomplete:
             request_test(basic)
         self.assertEqual(incomplete.exception.code, 400)
@@ -151,11 +151,30 @@ class SmokeTest(unittest.TestCase):
             self.assertEqual(response.status, 202)
             created = json.loads(response.read())["test"]
         self.assertFalse(created["retain_results"])
+        cancel_path = self.base + f"/api/v1/web/runs/{run_id}/tests/{created['id']}/cancel"
+
+        def cancel_test(password):
+            request = Request(cancel_path, data=json.dumps({"password": password}).encode(), method="POST",
+                              headers={"Content-Type": "application/json", "X-Monitor-Request": "dashboard"})
+            return browser.open(request, timeout=2)
+
+        with self.assertRaises(HTTPError) as forbidden:
+            cancel_test("wrong")
+        self.assertEqual(forbidden.exception.code, 403)
+        with cancel_test("test-password") as response:
+            self.assertEqual(json.loads(response.read())["test"]["status"], "cancelled")
+        with request_test({**basic, "confirm_incomplete": True,
+                           "confirm_name": "Test route partial"}) as response:
+            created = json.loads(response.read())["test"]
         _, response = self.post_json("/api/v1/agents/tests/claim", {
             "agent_id": "test-agent", "gpus": [{"index": 0, "idle_for_seconds": 60,
-                                                 "memory_used_mb": 20, "utilization_percent": 0}],
+                                                 "memory_used_mb": 20, "memory_free_mb": 24000,
+                                                 "utilization_percent": 0}],
         })
         self.assertEqual(response["test"]["id"], created["id"])
+        with self.assertRaises(HTTPError) as conflict:
+            cancel_test("test-password")
+        self.assertEqual(conflict.exception.code, 409)
         _, response = self.post_json(f"/api/v1/agents/tests/{created['id']}/status", {
             "agent_id": "test-agent", "status": "completed", "metrics": {"map": 0.42},
         })

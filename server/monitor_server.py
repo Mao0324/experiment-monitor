@@ -1714,7 +1714,8 @@ class Store:
                 VALUES (?,?,?,?,'queued',?,?,?,?)""",
                 (request_id, run_id, profile_id, hostname, int(complete), run_dir, now, now),
             )
-        return self.list_test_requests(run_id)[0]
+        with self.connect() as conn:
+            return self._test_row(conn.execute("SELECT * FROM test_requests WHERE id=?", (request_id,)).fetchone())
 
     def claim_test_request(self, agent_id: str, gpus: list[dict]) -> dict | None:
         now = utc_now()
@@ -1724,16 +1725,11 @@ class Store:
             if not agent or not safe_json(agent["capabilities_json"], {}).get("test_v1"):
                 return None
             cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(timespec="seconds")
-            if (agent["updated_at"] < cutoff or agent["state"] != "idle"
-                    or agent["current_job_id"] or agent["current_test_id"]):
+            if (agent["updated_at"] < cutoff or agent["state"] not in {"idle", "running"}
+                    or agent["current_test_id"]):
                 return None
             profiles = {item["id"]: item for item in safe_json(agent["test_profiles_json"], [])}
             reserved = set()
-            for row in conn.execute(
-                """SELECT q.assigned_gpus_json FROM queue_jobs q JOIN agents a ON a.id=q.agent_id
-                WHERE a.hostname=? AND q.status IN ('leased','running')""", (agent["hostname"],)
-            ):
-                reserved.update(safe_json(row["assigned_gpus_json"], []))
             for row in conn.execute(
                 "SELECT assigned_gpu FROM test_requests WHERE hostname=? AND status IN ('leased','running')",
                 (agent["hostname"],),
@@ -1753,9 +1749,7 @@ class Store:
                         index = int(gpu["index"])
                         ready = (index not in reserved and gpu.get("cuda_usable") is not False
                                  and gpu.get("telemetry_usable") is not False
-                                 and float(gpu.get("utilization_percent") or 0) <= 5
-                                 and float(gpu.get("memory_used_mb") or 0) <= 3000
-                                 and float(gpu.get("idle_for_seconds") or 0) >= 60)
+                                 and float(gpu.get("memory_free_mb") or 0) >= 5120)
                     except (KeyError, TypeError, ValueError):
                         continue
                     if ready:
@@ -1767,6 +1761,21 @@ class Store:
                         leased = conn.execute("SELECT * FROM test_requests WHERE id=?", (row["id"],)).fetchone()
                         return self._test_row(leased)
         return None
+
+    def cancel_test_request(self, run_id: str, test_id: str) -> dict | None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM test_requests WHERE id=? AND run_id=?", (test_id, run_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] != "queued":
+                raise ValueError("只有尚未被 Agent 领取的测试可以取消排队")
+            conn.execute(
+                "UPDATE test_requests SET status='cancelled',updated_at=?,ended_at=? WHERE id=? AND status='queued'",
+                (now, now, test_id),
+            )
+            return self._test_row(conn.execute("SELECT * FROM test_requests WHERE id=?", (test_id,)).fetchone())
 
     def update_test_request(self, test_id: str, payload: dict) -> dict | None:
         status = str(payload.get("status") or "")
@@ -2848,6 +2857,7 @@ STYLE += ".script-picker-folder{margin-bottom:14px}.script-picker-folder>label{d
 
 
 STYLE += ".test-results{margin-top:16px}.test-result-row{padding:14px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}.test-result-row strong{font-size:14px}.test-metric-line{margin:8px 0;font-weight:650;color:var(--text)}.test-result-row details{margin-top:8px}.test-result-row pre{max-height:220px}.test-overview .panel-heading{align-items:center}.test-overview .controls{margin:14px 0 0}.test-overview select{min-width:210px;max-width:100%}.test-metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-top:12px}.test-metric-item{min-width:0;border-top:1px solid var(--line);padding-top:9px}.test-metric-item strong{display:block;margin-top:4px;font-size:22px;font-variant-numeric:tabular-nums}.test-summary-meta{font-size:12px;color:var(--muted)}@media(max-width:700px){.test-metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.test-overview .controls{align-items:stretch}.test-overview select{width:100%}}"
+STYLE += ".test-overview #cancelQueuedTest[hidden]{display:none}"
 
 
 def page(title: str, body: str, refresh: int | None = None) -> str:
@@ -3896,7 +3906,7 @@ def run_html(run: dict, events: list[dict]) -> str:
     <div class="panel detail-hero"><div class="detail-kpis"><div class="detail-kpi"><div class="label">Epoch</div><div id="epochValue" class="value">{run['current_epoch']} / {total}</div></div><div class="detail-kpi"><div class="label">Best Val mAP50-95</div><div id="bestMapValue" class="value">{percentage(best_map)}</div></div><div class="detail-kpi"><div class="label">vs Baseline (Val)</div><div id="baselineDeltaValue" class="value">{baseline_delta_html(run, best_map)}</div></div><div class="detail-kpi"><div class="label">ETA</div><div id="etaValue" class="value">{human_duration(run.get('eta_seconds'))}</div></div></div><div class="bar"><div id="progressFill" class="fill" style="width:{pct:.1f}%"></div></div><div class="detail-meta"><span>Batch <strong id="batchValue">{run.get('current_batch') or '—'} / {run.get('total_batches') or '—'}</strong></span><span>已运行 <strong id="elapsedValue">{human_duration(run.get('elapsed_seconds'))}</strong></span><span id="environmentBrief">{html.escape(environment)}</span></div></div>
     <div id="dynamicError" class="panel" style="display:{'block' if run.get('error_message') else 'none'}"><h3>错误信息</h3><pre id="dynamicErrorText">{html.escape(run.get('error_message') or '')}</pre></div>
     <nav class="tab-list" role="tablist" aria-label="实验详情"><button class="tab-button" type="button" role="tab" data-tab="overview" aria-selected="true">总览</button><button class="tab-button" type="button" role="tab" data-tab="metrics" aria-selected="false">指标曲线</button><button class="tab-button" type="button" role="tab" data-tab="resources" aria-selected="false">资源监控</button><button class="tab-button" type="button" role="tab" data-tab="logs" aria-selected="false">日志</button><button class="tab-button" type="button" role="tab" data-tab="environment" aria-selected="false">配置环境</button><button class="tab-button" type="button" role="tab" data-tab="artifacts" aria-selected="false">产物</button><button class="tab-button" type="button" role="tab" data-tab="notes" aria-selected="false">实验记录</button></nav>
-    <section class="tab-panel" id="tab-overview" role="tabpanel"><div class="panel test-overview"><div class="panel-heading"><div><h3>Test · 测试集</h3><div id="testSummaryStatus" class="muted">正在读取测试记录…</div></div><a href="#artifacts">全部测试记录</a></div><div id="testSummary" aria-live="polite"><span class="muted">尚无测试集结果。</span></div><div class="controls"><select id="testProfile" class="filter-input" aria-label="测试方案"></select><button id="startTest" class="button" type="button" disabled>运行测试集</button><span id="testMessage" class="muted"></span></div></div><div class="panel"><div class="metric-section"><h3>Validation · 验证集</h3><div id="performanceMetrics">{performance_html(events, latest_metrics)}</div></div><div class="metric-section"><h3>Loss</h3><div id="lossMetrics">{losses_html(latest_metrics)}</div></div><div class="muted">最佳值来自各指标的历史 Epoch；上方大数字为最新/最终值。完整曲线和所有原始指标见「指标曲线」。</div></div></section>
+    <section class="tab-panel" id="tab-overview" role="tabpanel"><div class="panel test-overview"><div class="panel-heading"><div><h3>Test · 测试集</h3><div id="testSummaryStatus" class="muted">正在读取测试记录…</div></div><a href="#artifacts">全部测试记录</a></div><div id="testSummary" aria-live="polite"><span class="muted">尚无测试集结果。</span></div><div class="controls"><select id="testProfile" class="filter-input" aria-label="测试方案"></select><button id="startTest" class="button" type="button" disabled>运行测试集</button><button id="cancelQueuedTest" class="button" type="button" hidden>取消排队</button><span id="testMessage" class="muted"></span></div></div><div class="panel"><div class="metric-section"><h3>Validation · 验证集</h3><div id="performanceMetrics">{performance_html(events, latest_metrics)}</div></div><div class="metric-section"><h3>Loss</h3><div id="lossMetrics">{losses_html(latest_metrics)}</div></div><div class="muted">最佳值来自各指标的历史 Epoch；上方大数字为最新/最终值。完整曲线和所有原始指标见「指标曲线」。</div></div></section>
     <section class="tab-panel" id="tab-metrics" role="tabpanel" hidden>{chart}<div class="panel"><h3>最佳 Epoch</h3><div id="bestEpoch">{best_epoch_html(best)}</div><details><summary>查看全部最新/最终原始指标</summary><div id="latestMetrics">{metric_chips(latest_metrics)}</div></details></div></section>
     <section class="tab-panel" id="tab-resources" role="tabpanel" hidden><div class="panel"><h3>GPU / 主机状态</h3><div id="hostStatus">{host_status_html(run.get('host_status') or {})}</div></div></section>
     <section class="tab-panel" id="tab-logs" role="tabpanel" hidden><div class="panel"><h3>实时日志尾部</h3><div class="muted">SSE 实时更新；保留最近约 12,000 个字符。</div><pre id="logTail" class="log-tail">{log_text}</pre></div></section>
@@ -3913,10 +3923,14 @@ def run_html(run: dict, events: list[dict]) -> str:
     const aiButton=document.getElementById('generateAi'),aiMessage=document.getElementById('aiMessage'),aiReport=document.getElementById('aiReport'),aiEmpty=document.getElementById('aiEmpty');let aiPollTimer=null;
     const updateAiUi=r=>{{const status=r.ai_status||'not_requested',emailStatus=r.ai_email_status||'not_requested';document.getElementById('aiStatusValue').textContent=aiLabels[status]||status;document.getElementById('aiModelsValue').textContent=(r.ai_models||[]).join('、')||'—';document.getElementById('aiRequestedAt').textContent=r.ai_requested_at?'　提交时间：'+r.ai_requested_at:'';document.getElementById('aiGeneratedAt').textContent=r.ai_generated_at?'　生成时间：'+r.ai_generated_at:'';document.getElementById('aiEmailStatus').textContent='邮件：'+(emailLabels[emailStatus]||emailStatus)+(r.ai_email_sent_at?'（'+r.ai_email_sent_at+'）':'');const error=r.ai_error||r.ai_email_error||'';aiMessage.textContent=error||(status==='running'?'服务器已受理，正在生成报告；刷新页面不会丢失此状态。':status==='completed'?'报告已生成。':'');const report=r.ai_report||'';aiReport.textContent=report;aiReport.style.display=report?'block':'none';aiEmpty.style.display=report?'none':'block';aiButton.disabled=status==='running';aiButton.textContent=status==='running'?'正在生成…':'生成结论并发送邮件';if(status==='running'&&!aiPollTimer)aiPollTimer=setInterval(pollAi,3000);if(status!=='running'&&aiPollTimer){{clearInterval(aiPollTimer);aiPollTimer=null}}}};
     const pollAi=async()=>{{try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/ai-status',{{headers:{{'X-Monitor-Request':'dashboard'}},cache:'no-store'}});if(response.ok)updateAiUi(await response.json())}}catch{{}}}};
-    const testProfile=document.getElementById('testProfile'),testResults=document.getElementById('testResults'),testMessage=document.getElementById('testMessage'),testButton=document.getElementById('startTest'),testSummary=document.getElementById('testSummary'),testSummaryStatus=document.getElementById('testSummaryStatus');let testInProgress=false;
-    const testStatusLabels={{queued:'等待空闲 GPU',leased:'Agent 已领取',running:'测试中',completed:'已完成',failed:'失败'}};
+    const testProfile=document.getElementById('testProfile'),testResults=document.getElementById('testResults'),testMessage=document.getElementById('testMessage'),testButton=document.getElementById('startTest'),cancelTestButton=document.getElementById('cancelQueuedTest'),testSummary=document.getElementById('testSummary'),testSummaryStatus=document.getElementById('testSummaryStatus');let testInProgress=false,queuedTestId='';
+    const testStatusLabels={{queued:'等待单卡可用显存 ≥ 5 GiB',leased:'Agent 已领取',running:'测试中',completed:'已完成',failed:'失败',cancelled:'已取消'}};
     function renderTestSummary(items){{
       const newest=items[0],completed=items.find(item=>item.status==='completed'&&Object.keys(item.metrics||{{}}).length);
+      queuedTestId=(items.find(item=>item.status==='queued')||{{}}).id||'';cancelTestButton.hidden=!queuedTestId;
+      if(queuedTestId)testMessage.textContent='等待单卡可用显存 ≥ 5 GiB，无需 GPU 空闲。';
+      else if(newest&&['leased','running'].includes(newest.status))testMessage.textContent=testStatusLabels[newest.status];
+      else if(newest&&newest.status==='completed'&&testMessage.textContent.startsWith('已提交'))testMessage.textContent='测试已完成。';
       testSummaryStatus.textContent=newest?'最近一次：'+(testStatusLabels[newest.status]||newest.status)+' · '+newest.hostname:'尚未测试';
       testSummary.replaceChildren();
       if(!completed){{const empty=document.createElement('span');empty.className='muted';empty.textContent='尚无测试集指标。';testSummary.append(empty);return}}
@@ -3930,6 +3944,20 @@ def run_html(run: dict, events: list[dict]) -> str:
       }}
       testSummary.append(meta,grid);
     }}
+    cancelTestButton.addEventListener('click',async()=>{{
+      if(!queuedTestId||!confirm('确定取消这次尚未开始的测试吗？'))return;
+      const password=prompt('请输入管理员密码以取消测试排队：');
+      if(password===null)return;
+      const testId=queuedTestId;
+      cancelTestButton.disabled=true;
+      try{{
+        const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/tests/'+encodeURIComponent(testId)+'/cancel',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{password}})}});
+        const result=await response.json();
+        testMessage.textContent=response.ok?'已取消排队。':result.error||'取消失败';
+        await pollTests();
+      }}catch{{testMessage.textContent='网络错误，取消状态尚未确认。'}}
+      finally{{cancelTestButton.disabled=false}}
+    }});
     async function pollTests(){{try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/tests',{{cache:'no-store'}});if(!response.ok)return;const data=await response.json(),selected=testProfile.value;testProfile.replaceChildren();for(const profile of data.profiles||[]){{const option=document.createElement('option');option.value=profile.hostname+'|'+profile.id;option.textContent=profile.label+' · '+profile.hostname;testProfile.append(option)}}if([...testProfile.options].some(option=>option.value===selected))testProfile.value=selected;testInProgress=(data.tests||[]).some(item=>['queued','leased','running','疑似掉线（待核验）'].includes(item.status));testButton.disabled=!testProfile.options.length||testInProgress;testButton.textContent=testInProgress?'测试排队或运行中':'运行测试集';renderTestSummary(data.tests||[]);testResults.replaceChildren();for(const item of data.tests||[]){{const row=document.createElement('div');row.className='test-result-row';const heading=document.createElement('strong');heading.textContent=(item.retain_results?'正式测试':'未完成实验 · 临时测试')+' · '+(testStatusLabels[item.status]||item.status);row.append(heading);const info=document.createElement('div');info.className='muted';info.textContent=item.profile_id+' · '+item.hostname+' · '+item.created_at;row.append(info);if(item.error){{const error=document.createElement('div');error.textContent=item.error;row.append(error)}}const metrics=item.metrics||{{}};if(Object.keys(metrics).length){{const metricLine=document.createElement('div');metricLine.className='test-metric-line';metricLine.textContent=Object.entries(metrics).map(([key,value])=>key+' '+Number(value).toFixed(4)).join(' · ');row.append(metricLine)}}if(item.result_path){{const path=document.createElement('div');path.className='muted';path.textContent='已保留：'+item.result_path;row.append(path)}}if(item.log_tail){{const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='查看测试日志';const pre=document.createElement('pre');pre.className='log-tail';pre.textContent=item.log_tail;details.append(summary,pre);row.append(details)}}testResults.append(row)}}if(!(data.tests||[]).length)testResults.textContent='尚无测试记录。';if(!(data.profiles||[]).length)testMessage.textContent='此实验没有在线训练机可用的测试方案。';else if(testMessage.textContent.startsWith('此实验没有'))testMessage.textContent=''}}catch{{testMessage.textContent='测试状态暂时无法刷新。';testSummaryStatus.textContent='测试状态暂不可用'}}}}
     testButton.addEventListener('click',async()=>{{const selected=testProfile.value;if(!selected||testInProgress)return;const [hostname,profile_id]=selected.split('|');let runStatus={json.dumps(run['status'])},currentEpoch={int(run.get('current_epoch') or 0)},totalEpochs={int(run.get('total_epochs') or 0)};try{{const response=await fetch('/api/v1/public/runs/'+encodeURIComponent(runId),{{cache:'no-store'}});if(response.ok){{const latest=(await response.json()).run;runStatus=latest.status;currentEpoch=latest.current_epoch||0;totalEpochs=latest.total_epochs||0}}}}catch{{}}const complete=runStatus==='completed'&&(!totalEpochs||currentEpoch>=totalEpochs);let confirmName='';if(!complete){{if(!confirm('这个实验尚未完整训练结束。测试只保留网页结果，不在原实验目录保存文件。确定继续吗？'))return;confirmName=prompt('第二次确认：请输入完整实验名称 '+{json.dumps(run['name'],ensure_ascii=False)}+'：');if(confirmName!=={json.dumps(run['name'],ensure_ascii=False)}){{if(confirmName!==null)alert('实验名称不匹配，未提交测试。');return}}}}const password=prompt('请输入管理员密码以提交测试：');if(password===null)return;testButton.disabled=true;testMessage.textContent='正在提交…';try{{const response=await fetch('/api/v1/web/runs/'+encodeURIComponent(runId)+'/tests',{{method:'POST',headers:{{'Content-Type':'application/json','X-Monitor-Request':'dashboard'}},body:JSON.stringify({{hostname,profile_id,confirm_incomplete:!complete,confirm_name:confirmName,password}})}});const result=await response.json();testMessage.textContent=response.ok?'已提交，等待空闲 GPU。':result.error||'提交失败';await pollTests()}}catch{{testMessage.textContent='网络错误，服务器未确认提交。'}}finally{{testButton.disabled=!testProfile.options.length||testInProgress}}}});pollTests();setInterval(pollTests,5000);
     const dot=document.getElementById('liveDot'),liveText=document.getElementById('liveText');const stream=new EventSource('/events/runs/'+encodeURIComponent(runId));stream.onopen=()=>{{dot.classList.remove('offline');liveText.textContent='实时连接正常'}};stream.onerror=()=>{{dot.classList.add('offline');liveText.textContent='实时连接中断，正在重连'}};stream.onmessage=event=>{{const data=JSON.parse(event.data),r=data.run,f=data.fragments,total=r.total_epochs||0;document.getElementById('statusBadge').innerHTML=f.status;document.getElementById('epochValue').textContent=(r.current_epoch||0)+' / '+total;document.getElementById('batchValue').textContent=(r.current_batch??'—')+' / '+(r.total_batches??'—');document.getElementById('elapsedValue').textContent=duration(r.elapsed_seconds);document.getElementById('etaValue').textContent=duration(r.eta_seconds);document.getElementById('bestMapValue').textContent=f.best_map;document.getElementById('baselineDeltaValue').innerHTML=f.baseline_delta;document.getElementById('performanceMetrics').innerHTML=f.performance;document.getElementById('lossMetrics').innerHTML=f.losses;document.getElementById('environmentBrief').textContent=f.environment_brief;document.getElementById('progressFill').style.width=(total?Math.min(100,100*(r.current_epoch||0)/total):0)+'%';document.getElementById('latestMetrics').innerHTML=f.metrics;document.getElementById('bestEpoch').innerHTML=f.best;document.getElementById('hostStatus').innerHTML=f.host;document.getElementById('resultMetrics').innerHTML=f.result;document.getElementById('reproducibility').innerHTML=f.reproducibility;document.getElementById('logTail').textContent=r.log_tail||'训练端尚未上报日志。';if(window.updateTrendSources)window.updateTrendSources([{{id:r.id,name:r.name,events:data.events}}]);const errorBox=document.getElementById('dynamicError');if(r.error_message){{errorBox.style.display='block';document.getElementById('dynamicErrorText').textContent=r.error_message}}else errorBox.style.display='none';if(document.activeElement!==document.getElementById('groupName'))document.getElementById('groupName').value=r.group_name||'';if(document.activeElement!==document.getElementById('tagsInput'))document.getElementById('tagsInput').value=(r.tags||[]).join(', ');document.getElementById('favoriteInput').checked=!!r.favorite;for(const [id,key] of [['hypothesis','hypothesis'],['changeNotes','change_notes'],['resultNotes','result_notes'],['conclusion','conclusion'],['nextStep','next_step'],['baselineRunId','baseline_run_id']]){{const field=document.getElementById(id);if(document.activeElement!==field)field.value=r[key]||''}}updateAiUi(r)}};
@@ -4497,6 +4525,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(404, {"error": "run not found"})
             else:
                 self.send_json(200, {"run": run})
+            return
+        if path.startswith("/api/v1/web/runs/") and path.endswith("/cancel") and "/tests/" in path:
+            try:
+                payload = self.read_json()
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            password = str(payload.get("password") or "")
+            if (self.headers.get("X-Monitor-Request") != "dashboard" or not CFG.admin_password
+                    or not hmac.compare_digest(password, CFG.admin_password)):
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "forbidden"})
+                return
+            match = re.fullmatch(r"/api/v1/web/runs/([^/]+)/tests/([^/]+)/cancel", path)
+            if not match:
+                self.send_json(404, {"error": "not found"})
+                return
+            run_id, test_id = (unquote(part) for part in match.groups())
+            try:
+                test = STORE.cancel_test_request(run_id, test_id)
+            except ValueError as exc:
+                self.send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            else:
+                self.send_json(200, {"test": test}) if test else self.send_json(404, {"error": "test not found"})
             return
         if path.startswith("/api/v1/web/runs/") and path.endswith("/tests"):
             try:
