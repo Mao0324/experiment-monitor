@@ -99,6 +99,8 @@ class Agent:
         self.test_stage = ""
         self.test_report: dict | None = None
         self.test_thread: threading.Thread | None = None
+        self.pending_test: dict | None = None
+        self.pending_test_report: dict | None = None
         self.test_state_path = self.state_path.with_name(self.state_path.stem + ".test.json")
         self._load_state()
         self._load_test_state()
@@ -153,8 +155,14 @@ class Agent:
         return self.log_dir / f"test-{test['id']}.log"
 
     def _write_test_state(self):
-        value = {"test": self.current_test, "pid": self.test_pid, "stage": self.test_stage,
-                 "report": self.test_report} if self.current_test else {}
+        if self.current_test:
+            value = {"test": self.current_test, "pid": self.test_pid, "stage": self.test_stage,
+                     "report": self.test_report}
+        elif self.pending_test:
+            value = {"test": self.pending_test, "pid": 0, "stage": "",
+                     "report": self.pending_test_report, "pending": True}
+        else:
+            value = {}
         temporary = self.test_state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.test_state_path)
@@ -164,12 +172,39 @@ class Agent:
             value = json.loads(self.test_state_path.read_text(encoding="utf-8"))
             test = value.get("test")
             if isinstance(test, dict) and test.get("id"):
-                self.current_test = test
-                self.test_pid = int(value.get("pid") or 0)
-                self.test_stage = str(value.get("stage") or "")
-                self.test_report = value.get("report") if isinstance(value.get("report"), dict) else None
+                report = value.get("report") if isinstance(value.get("report"), dict) else None
+                if value.get("pending"):
+                    self.pending_test, self.pending_test_report = test, report
+                else:
+                    self.current_test = test
+                    self.test_pid = int(value.get("pid") or 0)
+                    self.test_stage = str(value.get("stage") or "")
+                    self.test_report = report
         except (OSError, ValueError, TypeError):
             return
+
+    def _queue_pending_test_report(self, test: dict, report: dict):
+        self.pending_test, self.pending_test_report = dict(test), dict(report)
+        self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
+        self.test_stage = ""
+        self._write_test_state()
+
+    def flush_pending_test(self):
+        if not self.pending_test or not self.pending_test_report:
+            return
+        test, report = self.pending_test, self.pending_test_report
+        try:
+            self.update_test(test, **report)
+        except HTTPError as exc:
+            if exc.code != 404:
+                return
+            print(f"[queue agent] pending test {test['id']} no longer exists on server; releasing local report", flush=True)
+        except (OSError, URLError, RuntimeError):
+            return
+        else:
+            print(f"[queue agent] delivered pending test result {test['id']}", flush=True)
+        self.pending_test, self.pending_test_report = None, None
+        self._write_test_state()
 
     def test_process_matches(self, pid: int, test_id: str) -> bool:
         if not self.process_alive(pid):
@@ -777,7 +812,11 @@ class Agent:
             self.test_report = {"status": status, "log_tail": log_text[-12000:], "metrics": metrics,
                                 "result_path": result_path, "error": error}
             self._write_test_state()
-            self.update_test(test, **self.test_report)
+            try:
+                self.update_test(test, **self.test_report)
+            except (HTTPError, URLError, OSError, RuntimeError):
+                self._queue_pending_test_report(test, self.test_report)
+                return
             self.current_test, self.test_process, self.test_pid, self.test_report = None, None, 0, None
             self._write_test_state()
         except (OSError, ValueError, RuntimeError, HTTPError, URLError) as exc:
@@ -788,6 +827,7 @@ class Agent:
                 self._write_test_state()
                 return
             if self.test_report:
+                self._queue_pending_test_report(test, self.test_report)
                 return
             if not self.test_pid or not self.test_process_matches(self.test_pid, test["id"]):
                 self._cleanup_test_stage(test)
@@ -1083,7 +1123,9 @@ class Agent:
                 try:
                     gpus = self.gpu_status()
                     self.heartbeat(gpus)
-                    if not self.current_test and not (self.test_thread and self.test_thread.is_alive()):
+                    self.flush_pending_test()
+                    if (not self.current_test and not self.pending_test
+                            and not (self.test_thread and self.test_thread.is_alive())):
                         test = self.claim_test(gpus)
                         if test:
                             self.start_test_thread(test)
@@ -1242,6 +1284,10 @@ class Agent:
         print(f"[queue agent] {self.agent_id} connected to {self.server}", flush=True)
         while not self.stop_requested:
             try:
+                self.flush_pending_test()
+                if self.pending_test and not self.current_job:
+                    time.sleep(self.poll_seconds)
+                    continue
                 if self.current_test:
                     if self.test_thread and self.test_thread.is_alive():
                         if not self.current_job:

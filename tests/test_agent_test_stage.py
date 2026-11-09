@@ -38,6 +38,27 @@ class AgentTestStageTest(unittest.TestCase):
             agent.start_test_thread.assert_called_once_with(test)
             agent.finish_process.assert_called_once_with(job, 0)
 
+    def test_completed_test_report_survives_callback_timeout(self):
+        spec = importlib.util.spec_from_file_location("test_pending_queue_agent", AGENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            config = {"server_url": "https://example.invalid", "api_token": "test",
+                      "allowed_roots": [temporary], "training_python": sys.executable,
+                      "log_directory": temporary}
+            agent = module.Agent(config)
+            test = {"id": "test-pending", "run_id": "run", "profile_id": "esc"}
+            report = {"status": "completed", "metrics": {"mAP50-95": 0.42}, "log_tail": "metrics"}
+            agent._queue_pending_test_report(test, report)
+            recovered = module.Agent(config)
+            self.assertEqual(recovered.pending_test["id"], test["id"])
+            delivered = []
+            recovered.update_test = lambda item, **values: delivered.append((item, values)) or item
+            recovered.flush_pending_test()
+            self.assertEqual(delivered[0][0]["id"], test["id"])
+            self.assertIsNone(recovered.pending_test)
+            self.assertEqual(recovered.test_state_path.read_text(encoding="utf-8"), "{}")
+
     def test_incomplete_run_uses_isolated_directory(self):
         spec = importlib.util.spec_from_file_location("test_stage_queue_agent", AGENT)
         module = importlib.util.module_from_spec(spec)
