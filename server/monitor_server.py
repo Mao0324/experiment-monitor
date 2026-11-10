@@ -476,6 +476,15 @@ class Store:
             test_columns = {row[1] for row in conn.execute("PRAGMA table_info(test_requests)")}
             if "checkpoint_epoch" not in test_columns:
                 conn.execute("ALTER TABLE test_requests ADD COLUMN checkpoint_epoch INTEGER")
+            for test_row in conn.execute(
+                "SELECT id,run_id FROM test_requests WHERE checkpoint_epoch IS NULL"
+            ).fetchall():
+                best = self._best_metric_from_conn(conn, test_row["run_id"])
+                if best and best[2] is not None:
+                    conn.execute(
+                        "UPDATE test_requests SET checkpoint_epoch=? WHERE id=? AND checkpoint_epoch IS NULL",
+                        (best[2], test_row["id"]),
+                    )
             conn.execute(
                 """UPDATE queue_jobs SET fault_suggestion=''
                 WHERE status IN ('queued','leased','running','completed')
