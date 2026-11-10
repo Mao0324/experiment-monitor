@@ -188,6 +188,7 @@ class DashboardUiTest(unittest.TestCase):
         self.assertIn('Validation · 验证集', detail)
         self.assertIn('Test · 测试集', detail)
         self.assertIn('id="testSummary"', detail)
+        self.assertIn('Best Epoch', detail)
         self.assertEqual(detail.count('id="startTest"'), 1)
         self.assertIn('Best Val mAP50-95', homepage)
         self.assertIn('name="confirm_name"', detail)

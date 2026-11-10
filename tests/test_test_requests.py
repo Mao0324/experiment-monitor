@@ -102,6 +102,23 @@ class TestRequestsTest(unittest.TestCase):
         })
         self.assertEqual(result["result_path"], "")
 
+    def test_test_claim_records_best_checkpoint_epoch(self):
+        store = self.server.STORE
+        run = self.run_record("best-epoch")
+        with store.connect() as conn:
+            conn.execute(
+                "INSERT INTO metric_events(run_id,epoch,phase,created_at,metrics_json) VALUES (?,?,?,?,'{\"metrics/mAP50-95(B)\":0.41}')",
+                (run["id"], 4, "epoch", self.server.utc_now()),
+            )
+            conn.execute(
+                "INSERT INTO metric_events(run_id,epoch,phase,created_at,metrics_json) VALUES (?,?,?,?,'{\"metrics/mAP50-95(B)\":0.63}')",
+                (run["id"], 7, "epoch", self.server.utc_now()),
+            )
+        test = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        self.assertIsNone(test["checkpoint_epoch"])
+        claimed = store.claim_test_request("ubuntu-slot-1", self.idle_gpus())
+        self.assertEqual(claimed["checkpoint_epoch"], 7)
+
     def test_script_profile_is_not_a_web_command(self):
         run = self.run_record("safe")
         with self.assertRaises(ValueError):
