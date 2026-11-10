@@ -102,6 +102,19 @@ class TestRequestsTest(unittest.TestCase):
         })
         self.assertEqual(result["result_path"], "")
 
+    def test_early_stopped_completed_run_is_testable_without_confirmation(self):
+        store = self.server.STORE
+        store.start_run({"run_id": "early-stop", "name": "Experiment early-stop", "total_epochs": 150})
+        store.progress("early-stop", {"epoch": 149, "phase": "epoch", "metrics": {}})
+        run, _ = store.finish("early-stop", {
+            "status": "completed",
+            "result": {"save_dir": "/data/runs/ESCVehicle/early-stop"},
+        })
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["current_epoch"], 149)
+        test = store.create_test_request(run["id"], {"profile_id": "esc", "hostname": "ubuntu"})
+        self.assertTrue(test["retain_results"])
+
     def test_test_claim_records_best_checkpoint_epoch(self):
         store = self.server.STORE
         run = self.run_record("best-epoch")

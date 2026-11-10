@@ -192,6 +192,7 @@ class DashboardUiTest(unittest.TestCase):
         self.assertEqual(detail.count('id="startTest"'), 1)
         self.assertIn('Best Val mAP50-95', homepage)
         self.assertIn('name="confirm_name"', detail)
+        self.assertIn("const complete=runStatus==='completed'", detail)
         self.assertIn("Hypothesis", detail)
         self.assertIn("Modification", detail)
         self.assertIn("Conclusion", detail)
